@@ -1,0 +1,502 @@
+# CyTOF Analysis Pipeline for Single File
+
+Here's a comprehensive CyTOF analysis pipeline in R for processing a single FCS file:
+
+```r
+# ================================================================================
+# CyTOF Single File Analysis Pipeline
+# ================================================================================
+
+# 1. INSTALL AND LOAD REQUIRED PACKAGES
+# ================================================================================
+
+# Install Bioconductor packages (if needed)
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+required_packages <- c(
+    "flowCore", "flowWorkspace", "ggcyto", 
+    "FlowSOM", "Rphenograph", "CATALYST",
+    "scater", "SingleCellExperiment", "ConsensusClusterPlus"
+)
+
+for (pkg in required_packages) {
+    if (!require(pkg, character.only = TRUE)) {
+        BiocManager::install(pkg)
+    }
+}
+
+# Load additional CRAN packages
+install.packages(c("Rtsne", "umap", "ggplot2", "pheatmap", "viridis", "gridExtra"))
+
+# Load all libraries
+library(flowCore)
+library(CATALYST)
+library(SingleCellExperiment)
+library(scater)
+library(FlowSOM)
+library(ConsensusClusterPlus)
+library(Rtsne)
+library(umap)
+library(ggplot2)
+library(pheatmap)
+library(viridis)
+library(gridExtra)
+
+# ================================================================================
+# 2. LOAD AND INSPECT DATA
+# ================================================================================
+
+# Set working directory
+setwd("path/to/your/data")
+
+# Load FCS file
+fcs_file <- "sample.fcs"
+ff <- read.FCS(fcs_file)
+
+# Inspect data
+cat("Number of cells:", nrow(ff), "\n")
+cat("Number of parameters:", ncol(ff), "\n")
+print(colnames(ff))
+
+# Check parameters
+pData(parameters(ff))
+
+# ================================================================================
+# 3. DATA PREPROCESSING
+# ================================================================================
+
+# Extract expression data
+expr_data <- exprs(ff)
+
+# Identify metal channels (CyTOF markers)
+# Adjust pattern based on your panel naming convention
+metal_channels <- grep("^[0-9]+[A-Z][a-z]_", colnames(ff), value = TRUE)
+cat("Metal channels found:", length(metal_channels), "\n")
+
+# Define marker types
+lineage_markers <- c(
+    "115In_CD45", "142Nd_CD19", "145Nd_CD4", 
+    "146Nd_CD8", "147Sm_CD3", "160Gd_CD14"
+    # Add your lineage markers
+)
+
+functional_markers <- c(
+    "150Nd_pSTAT1", "151Eu_pSTAT3", "152Sm_pSTAT5",
+    "154Sm_pSLP76", "158Gd_pZAP70"
+    # Add your functional markers
+)
+
+# Filter markers present in data
+lineage_markers <- intersect(lineage_markers, colnames(ff))
+functional_markers <- intersect(functional_markers, colnames(ff))
+all_markers <- c(lineage_markers, functional_markers)
+
+# ================================================================================
+# 4. QUALITY CONTROL
+# ================================================================================
+
+# Remove beads and debris based on DNA content and event length
+# Adjust channel names based on your data
+dna_channels <- grep("Ir", colnames(ff), value = TRUE)
+
+if (length(dna_channels) > 0) {
+    # DNA-based filtering
+    dna_signal <- rowSums(expr_data[, dna_channels, drop = FALSE])
+    dna_threshold <- quantile(dna_signal, 0.05)  # Remove bottom 5%
+    cells_keep <- dna_signal > dna_threshold
+    
+    cat("Cells removed by DNA filter:", sum(!cells_keep), "\n")
+    ff <- ff[cells_keep, ]
+    expr_data <- exprs(ff)
+}
+
+# Remove doublets (high DNA content)
+if (length(dna_channels) > 0) {
+    dna_signal <- rowSums(expr_data[, dna_channels, drop = FALSE])
+    dna_upper <- quantile(dna_signal, 0.98)  # Remove top 2%
+    cells_keep <- dna_signal < dna_upper
+    
+    cat("Doublets removed:", sum(!cells_keep), "\n")
+    ff <- ff[cells_keep, ]
+    expr_data <- exprs(ff)
+}
+
+# Plot QC metrics
+pdf("QC_plots.pdf", width = 12, height = 8)
+
+# Event length distribution
+if ("Event_length" %in% colnames(ff)) {
+    hist(expr_data[, "Event_length"], breaks = 100, 
+         main = "Event Length Distribution", xlab = "Event Length")
+}
+
+# DNA signal distribution
+if (length(dna_channels) > 0) {
+    hist(rowSums(expr_data[, dna_channels]), breaks = 100,
+         main = "DNA Signal Distribution", xlab = "DNA Signal (Ir191 + Ir193)")
+}
+
+dev.off()
+
+cat("Cells after QC:", nrow(ff), "\n")
+
+# ================================================================================
+# 5. DATA TRANSFORMATION
+# ================================================================================
+
+# Arcsinh transformation (cofactor = 5 is standard for CyTOF)
+cofactor <- 5
+expr_transformed <- asinh(expr_data[, all_markers] / cofactor)
+
+# Alternative: Using CATALYST for transformation
+# sce <- prepData(ff, panel = panel_data, md = metadata)
+# sce <- transformData(sce)
+
+# ================================================================================
+# 6. DIMENSIONALITY REDUCTION
+# ================================================================================
+
+# Subsample for faster computation (if needed)
+set.seed(123)
+n_subsample <- min(10000, nrow(expr_transformed))
+subsample_idx <- sample(1:nrow(expr_transformed), n_subsample)
+expr_subsample <- expr_transformed[subsample_idx, lineage_markers]
+
+# 6.1 t-SNE
+cat("Running t-SNE...\n")
+set.seed(123)
+tsne_result <- Rtsne(
+    expr_subsample,
+    dims = 2,
+    perplexity = 30,
+    verbose = TRUE,
+    max_iter = 1000
+)
+
+tsne_coords <- tsne_result$Y
+colnames(tsne_coords) <- c("tSNE1", "tSNE2")
+
+# 6.2 UMAP
+cat("Running UMAP...\n")
+set.seed(123)
+umap_result <- umap(
+    expr_subsample,
+    n_neighbors = 15,
+    min_dist = 0.1,
+    metric = "euclidean"
+)
+
+umap_coords <- umap_result$layout
+colnames(umap_coords) <- c("UMAP1", "UMAP2")
+
+# ================================================================================
+# 7. CLUSTERING
+# ================================================================================
+
+# 7.1 FlowSOM Clustering
+cat("Running FlowSOM clustering...\n")
+
+# Create flowFrame for FlowSOM
+ff_transformed <- ff
+exprs(ff_transformed)[, all_markers] <- expr_transformed
+
+# Run FlowSOM
+fsom <- FlowSOM(
+    ff_transformed,
+    compensate = FALSE,
+    transform = FALSE,
+    scale = FALSE,
+    colsToUse = lineage_markers,
+    nClus = 20,  # Number of metaclusters
+    seed = 123
+)
+
+# Get cluster assignments
+flowsom_clusters <- fsom$metaclustering[fsom$FlowSOM$map$mapping[,1]]
+
+# Add clusters to subsampled data
+flowsom_clusters_sub <- flowsom_clusters[subsample_idx]
+
+# 7.2 ConsensusClusterPlus (on FlowSOM SOM codes)
+cat("Running ConsensusClusterPlus...\n")
+
+som_codes <- fsom$FlowSOM$map$codes
+cc_result <- ConsensusClusterPlus(
+    t(som_codes),
+    maxK = 25,
+    reps = 100,
+    pItem = 0.9,
+    pFeature = 1,
+    clusterAlg = "hc",
+    innerLinkage = "average",
+    finalLinkage = "average",
+    distance = "euclidean",
+    seed = 123,
+    plot = "pdf"
+)
+
+# Extract optimal number of clusters (e.g., k=15)
+optimal_k <- 15
+consensus_clusters <- cc_result[[optimal_k]]$consensusClass[fsom$FlowSOM$map$mapping[,1]]
+consensus_clusters_sub <- consensus_clusters[subsample_idx]
+
+# ================================================================================
+# 8. VISUALIZATION
+# ================================================================================
+
+pdf("CyTOF_analysis_plots.pdf", width = 16, height = 12)
+
+# 8.1 t-SNE plots
+# Color by clusters
+tsne_df <- data.frame(
+    tSNE1 = tsne_coords[,1],
+    tSNE2 = tsne_coords[,2],
+    FlowSOM = factor(flowsom_clusters_sub),
+    Consensus = factor(consensus_clusters_sub)
+)
+
+p1 <- ggplot(tsne_df, aes(x = tSNE1, y = tSNE2, color = FlowSOM)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    theme_minimal() +
+    labs(title = "t-SNE colored by FlowSOM clusters") +
+    scale_color_viridis(discrete = TRUE) +
+    theme(legend.position = "right")
+
+p2 <- ggplot(tsne_df, aes(x = tSNE1, y = tSNE2, color = Consensus)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    theme_minimal() +
+    labs(title = "t-SNE colored by Consensus clusters") +
+    scale_color_viridis(discrete = TRUE) +
+    theme(legend.position = "right")
+
+print(p1)
+print(p2)
+
+# 8.2 UMAP plots
+umap_df <- data.frame(
+    UMAP1 = umap_coords[,1],
+    UMAP2 = umap_coords[,2],
+    FlowSOM = factor(flowsom_clusters_sub),
+    Consensus = factor(consensus_clusters_sub)
+)
+
+p3 <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = FlowSOM)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    theme_minimal() +
+    labs(title = "UMAP colored by FlowSOM clusters") +
+    scale_color_viridis(discrete = TRUE)
+
+p4 <- ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Consensus)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    theme_minimal() +
+    labs(title = "UMAP colored by Consensus clusters") +
+    scale_color_viridis(discrete = TRUE)
+
+print(p3)
+print(p4)
+
+# 8.3 Marker expression on t-SNE
+for (marker in lineage_markers) {
+    marker_expr <- expr_subsample[, marker]
+    
+    p <- ggplot(data.frame(tSNE1 = tsne_coords[,1],
+                          tSNE2 = tsne_coords[,2],
+                          Expression = marker_expr),
+               aes(x = tSNE1, y = tSNE2, color = Expression)) +
+        geom_point(size = 0.5, alpha = 0.6) +
+        scale_color_viridis() +
+        theme_minimal() +
+        labs(title = paste(marker, "expression on t-SNE"))
+    
+    print(p)
+}
+
+dev.off()
+
+# ================================================================================
+# 9. HEATMAP OF CLUSTER CHARACTERISTICS
+# ================================================================================
+
+# Calculate median expression per cluster
+cluster_medians <- matrix(0, nrow = optimal_k, ncol = length(all_markers))
+rownames(cluster_medians) <- paste0("Cluster_", 1:optimal_k)
+colnames(cluster_medians) <- all_markers
+
+for (i in 1:optimal_k) {
+    cluster_cells <- consensus_clusters == i
+    if (sum(cluster_cells) > 0) {
+        cluster_medians[i, ] <- apply(expr_transformed[cluster_cells, all_markers], 2, median)
+    }
+}
+
+# Create heatmap
+pdf("cluster_heatmap.pdf", width = 10, height = 8)
+
+pheatmap(
+    cluster_medians,
+    scale = "column",
+    clustering_distance_rows = "euclidean",
+    clustering_distance_cols = "euclidean",
+    clustering_method = "average",
+    color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+    main = "Median Marker Expression per Cluster",
+    fontsize = 10
+)
+
+dev.off()
+
+# ================================================================================
+# 10. CLUSTER FREQUENCIES AND STATISTICS
+# ================================================================================
+
+# Calculate cluster frequencies
+cluster_freq <- table(consensus_clusters)
+cluster_pct <- prop.table(cluster_freq) * 100
+
+cluster_summary <- data.frame(
+    Cluster = names(cluster_freq),
+    Count = as.numeric(cluster_freq),
+    Percentage = round(cluster_pct, 2)
+)
+
+print(cluster_summary)
+write.csv(cluster_summary, "cluster_frequencies.csv", row.names = FALSE)
+
+# ================================================================================
+# 11. DIFFERENTIAL EXPRESSION ANALYSIS (OPTIONAL)
+# ================================================================================
+
+# Compare marker expression between clusters
+# Example: Compare cluster 1 vs all others
+
+cluster_of_interest <- 1
+group1 <- consensus_clusters == cluster_of_interest
+group2 <- consensus_clusters != cluster_of_interest
+
+de_results <- data.frame(
+    Marker = all_markers,
+    Median_Cluster = apply(expr_transformed[group1, all_markers], 2, median),
+    Median_Others = apply(expr_transformed[group2, all_markers], 2, median),
+    Fold_Change = NA,
+    P_Value = NA
+)
+
+for (marker in all_markers) {
+    # Calculate fold change
+    de_results[de_results$Marker == marker, "Fold_Change"] <- 
+        de_results[de_results$Marker == marker, "Median_Cluster"] - 
+        de_results[de_results$Marker == marker, "Median_Others"]
+    
+    # Wilcoxon test
+    test_result <- wilcox.test(
+        expr_transformed[group1, marker],
+        expr_transformed[group2, marker]
+    )
+    de_results[de_results$Marker == marker, "P_Value"] <- test_result$p.value
+}
+
+de_results$Adjusted_P <- p.adjust(de_results$P_Value, method = "BH")
+de_results <- de_results[order(de_results$Adjusted_P), ]
+
+print(head(de_results, 10))
+write.csv(de_results, paste0("DE_cluster", cluster_of_interest, "_vs_others.csv"), 
+          row.names = FALSE)
+
+# ================================================================================
+# 12. SAVE RESULTS
+# ================================================================================
+
+# Save processed data
+save(
+    ff, expr_transformed, 
+    tsne_coords, umap_coords,
+    flowsom_clusters, consensus_clusters,
+    fsom, cluster_medians,
+    file = "CyTOF_analysis_results.RData"
+)
+
+# Export cluster assignments
+results_df <- data.frame(
+    Cell_ID = 1:nrow(expr_transformed),
+    FlowSOM_Cluster = flowsom_clusters,
+    Consensus_Cluster = consensus_clusters
+)
+
+write.csv(results_df, "cluster_assignments.csv", row.names = FALSE)
+
+# Export expression data with clusters
+export_df <- cbind(
+    results_df,
+    expr_transformed
+)
+
+write.csv(export_df, "expression_data_with_clusters.csv", row.names = FALSE)
+
+cat("\n=== Analysis Complete ===\n")
+cat("Results saved to:", getwd(), "\n")
+
+```
+
+## Additional: Alternative Pipeline Using CATALYST
+
+```r
+# ================================================================================
+# CATALYST-BASED PIPELINE (Alternative Approach)
+# ================================================================================
+
+library(CATALYST)
+library(flowCore)
+
+# 1. Prepare panel and metadata
+# Create a panel data frame
+panel <- data.frame(
+    fcs_colname = c("115In_CD45", "142Nd_CD19", "145Nd_CD4", "146Nd_CD8"),
+    antigen = c("CD45", "CD19", "CD4", "CD8"),
+    marker_class = c("type", "type", "type", "type")
+    # marker_class can be "type" (lineage) or "state" (functional)
+)
+
+# Create metadata
+metadata <- data.frame(
+    file_name = fcs_file,
+    sample_id = "Sample1",
+    condition = "Control"
+)
+
+# 2. Prepare data
+sce <- prepData(ff, panel = panel, md = metadata)
+
+# 3. Transform data
+sce <- transformData(sce, cofactor = 5)
+
+# 4. Clustering
+sce <- cluster(sce, features = "type", 
+               xdim = 10, ydim = 10, maxK = 20, seed = 123)
+
+# 5. Dimensionality reduction
+sce <- runDR(sce, dr = "TSNE", cells = 5000, features = "type")
+sce <- runDR(sce, dr = "UMAP", cells = 5000, features = "type")
+
+# 6. Plot results
+plotDR(sce, "TSNE", color_by = "meta20")
+plotDR(sce, "UMAP", color_by = "meta20")
+
+# 7. Heatmap
+plotExprHeatmap(sce, features = "type", by = "cluster_id", k = "meta20")
+
+# 8. Export results
+cluster_ids <- cluster_ids(sce, k = "meta20")
+write.csv(cluster_ids, "CATALYST_clusters.csv")
+
+```
+
+This pipeline provides:
+- Quality control and preprocessing
+- Multiple clustering approaches
+- Dimensionality reduction (t-SNE and UMAP)
+- Comprehensive visualization
+- Statistical analysis
+- Export of results
+
+Adjust parameters based on your specific panel and research questions!

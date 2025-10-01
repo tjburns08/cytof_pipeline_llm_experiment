@@ -1,0 +1,358 @@
+# CyTOF Analysis Pipeline for Single File
+
+Below is a comprehensive CyTOF (Mass Cytometry) analysis pipeline for processing a single FCS file in R.
+
+## Installation and Setup
+
+```r
+# Install required packages (run once)
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c("flowCore", "CATALYST", "SingleCellExperiment"))
+install.packages(c("Rtsne", "umap", "ggplot2", "FlowSOM", "ConsensusClusterPlus",
+                   "pheatmap", "RColorBrewer", "gridExtra", "reshape2"))
+
+# Load libraries
+library(flowCore)
+library(CATALYST)
+library(SingleCellExperiment)
+library(FlowSOM)
+library(Rtsne)
+library(umap)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(gridExtra)
+library(reshape2)
+```
+
+## 1. Data Import
+
+```r
+# Read FCS file
+fcs_file <- "your_cytof_file.fcs"
+fcs_data <- read.FCS(fcs_file, transformation = FALSE, truncate_max_range = FALSE)
+
+# Extract expression matrix
+expr_matrix <- exprs(fcs_data)
+print(paste("Dimensions:", nrow(expr_matrix), "cells x", ncol(expr_matrix), "parameters"))
+
+# View parameter names
+params <- parameters(fcs_data)$desc
+names(params) <- parameters(fcs_data)$name
+print(params)
+```
+
+## 2. Data Preprocessing
+
+```r
+# Define metal channels (adjust based on your panel)
+# Exclude DNA, beads, dead cells channels from clustering
+metal_cols <- grep("(Dd|Yb|Er|Sm|Nd|Pr|Eu|Gd|Tb|Dy|Ho|Tm|Lu)", 
+                   colnames(expr_matrix))
+
+# Define markers for clustering (example - adjust to your panel)
+clustering_markers <- c("CD3", "CD4", "CD8", "CD19", "CD20", "CD45", 
+                        "CD11b", "CD14", "CD16", "CD56")
+
+# Find columns matching your markers
+clustering_cols <- sapply(clustering_markers, function(marker) {
+    grep(marker, colnames(expr_matrix), ignore.case = TRUE)[1]
+})
+clustering_cols <- clustering_cols[!is.na(clustering_cols)]
+
+# Remove doublets (based on DNA content if available)
+dna_cols <- grep("Ir191|Ir193", colnames(expr_matrix))
+if(length(dna_cols) == 2) {
+    dna_sum <- rowSums(expr_matrix[, dna_cols])
+    dna_ratio <- expr_matrix[, dna_cols[1]] / dna_sum
+    
+    # Filter doublets (adjust thresholds as needed)
+    singlets <- dna_ratio > 0.4 & dna_ratio < 0.6
+    expr_matrix <- expr_matrix[singlets, ]
+    print(paste("After doublet removal:", nrow(expr_matrix), "cells"))
+}
+
+# Remove dead cells (if dead cell marker present)
+dead_col <- grep("Cisplatin|Viability", colnames(expr_matrix), ignore.case = TRUE)
+if(length(dead_col) > 0) {
+    live_cells <- expr_matrix[, dead_col] < 3  # Adjust threshold
+    expr_matrix <- expr_matrix[live_cells, ]
+    print(paste("After dead cell removal:", nrow(expr_matrix), "cells"))
+}
+
+# Arcsinh transformation (cofactor = 5 for CyTOF)
+expr_transformed <- asinh(expr_matrix / 5)
+```
+
+## 3. Quality Control Plots
+
+```r
+# Create QC directory
+dir.create("QC_plots", showWarnings = FALSE)
+
+# Signal intensity distributions
+pdf("QC_plots/signal_distributions.pdf", width = 12, height = 8)
+par(mfrow = c(3, 4))
+for(i in clustering_cols) {
+    hist(expr_transformed[, i], 
+         main = colnames(expr_matrix)[i],
+         xlab = "Asinh transformed intensity",
+         breaks = 50, col = "steelblue")
+}
+dev.off()
+
+# Heatmap of median intensities
+median_expr <- apply(expr_transformed[, clustering_cols], 2, median)
+pdf("QC_plots/median_expression_heatmap.pdf", width = 8, height = 6)
+pheatmap(matrix(median_expr, ncol = 1),
+         cluster_cols = FALSE,
+         main = "Median Marker Expression",
+         color = colorRampPalette(c("blue", "white", "red"))(100))
+dev.off()
+```
+
+## 4. Dimensionality Reduction
+
+```r
+# Subsample for faster computation (if needed)
+set.seed(42)
+max_cells <- 50000
+if(nrow(expr_transformed) > max_cells) {
+    sample_idx <- sample(1:nrow(expr_transformed), max_cells)
+} else {
+    sample_idx <- 1:nrow(expr_transformed)
+}
+
+# t-SNE
+set.seed(42)
+tsne_result <- Rtsne(expr_transformed[sample_idx, clustering_cols], 
+                     dims = 2, 
+                     perplexity = 30,
+                     verbose = TRUE,
+                     max_iter = 1000)
+
+tsne_coords <- data.frame(
+    tSNE1 = tsne_result$Y[, 1],
+    tSNE2 = tsne_result$Y[, 2]
+)
+
+# UMAP
+set.seed(42)
+umap_result <- umap(expr_transformed[sample_idx, clustering_cols],
+                    n_neighbors = 15,
+                    min_dist = 0.1)
+
+umap_coords <- data.frame(
+    UMAP1 = umap_result$layout[, 1],
+    UMAP2 = umap_result$layout[, 2]
+)
+
+# Plot t-SNE
+pdf("QC_plots/tsne_plot.pdf", width = 8, height = 6)
+ggplot(tsne_coords, aes(x = tSNE1, y = tSNE2)) +
+    geom_point(size = 0.5, alpha = 0.5, color = "steelblue") +
+    theme_classic() +
+    ggtitle("t-SNE projection")
+dev.off()
+
+# Plot UMAP
+pdf("QC_plots/umap_plot.pdf", width = 8, height = 6)
+ggplot(umap_coords, aes(x = UMAP1, y = UMAP2)) +
+    geom_point(size = 0.5, alpha = 0.5, color = "steelblue") +
+    theme_classic() +
+    ggtitle("UMAP projection")
+dev.off()
+```
+
+## 5. Clustering with FlowSOM
+
+```r
+# FlowSOM clustering
+set.seed(42)
+fsom <- FlowSOM(expr_transformed[sample_idx, clustering_cols],
+                compensate = FALSE,
+                transform = FALSE,
+                scale = FALSE,
+                colsToUse = 1:length(clustering_cols),
+                nClus = 20,  # Adjust number of metaclusters
+                seed = 42)
+
+# Extract cluster assignments
+clusters <- fsom$metaclustering[fsom$FlowSOM$map$mapping[, 1]]
+
+# Add clusters to dimensionality reduction data
+tsne_coords$cluster <- as.factor(clusters)
+umap_coords$cluster <- as.factor(clusters)
+
+# Plot t-SNE with clusters
+pdf("QC_plots/tsne_clusters.pdf", width = 10, height = 8)
+ggplot(tsne_coords, aes(x = tSNE1, y = tSNE2, color = cluster)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    theme_classic() +
+    scale_color_manual(values = colorRampPalette(brewer.pal(12, "Paired"))(20)) +
+    ggtitle("t-SNE with FlowSOM clusters")
+dev.off()
+
+# Plot UMAP with clusters
+pdf("QC_plots/umap_clusters.pdf", width = 10, height = 8)
+ggplot(umap_coords, aes(x = UMAP1, y = UMAP2, color = cluster)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    theme_classic() +
+    scale_color_manual(values = colorRampPalette(brewer.pal(12, "Paired"))(20)) +
+    ggtitle("UMAP with FlowSOM clusters")
+dev.off()
+```
+
+## 6. Cluster Characterization
+
+```r
+# Calculate mean expression per cluster
+cluster_means <- matrix(0, nrow = max(clusters), ncol = length(clustering_cols))
+colnames(cluster_means) <- colnames(expr_transformed)[clustering_cols]
+rownames(cluster_means) <- paste0("Cluster_", 1:max(clusters))
+
+for(i in 1:max(clusters)) {
+    cluster_cells <- clusters == i
+    cluster_means[i, ] <- colMeans(expr_transformed[sample_idx[cluster_cells], clustering_cols])
+}
+
+# Heatmap of cluster markers
+pdf("QC_plots/cluster_heatmap.pdf", width = 10, height = 8)
+pheatmap(cluster_means,
+         scale = "column",
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         main = "Cluster Marker Expression",
+         fontsize = 10)
+dev.off()
+
+# Calculate cluster frequencies
+cluster_freq <- table(clusters)
+cluster_pct <- prop.table(cluster_freq) * 100
+
+pdf("QC_plots/cluster_frequencies.pdf", width = 10, height = 6)
+barplot(cluster_pct, 
+        col = colorRampPalette(brewer.pal(12, "Paired"))(length(cluster_pct)),
+        main = "Cluster Frequencies",
+        xlab = "Cluster",
+        ylab = "Percentage of cells",
+        las = 2)
+dev.off()
+```
+
+## 7. Marker Expression on Dimensionality Reduction
+
+```r
+# Plot individual markers on t-SNE
+pdf("QC_plots/tsne_markers.pdf", width = 15, height = 10)
+plot_list <- list()
+for(i in 1:length(clustering_cols)) {
+    marker_name <- colnames(expr_transformed)[clustering_cols[i]]
+    tsne_coords$marker <- expr_transformed[sample_idx, clustering_cols[i]]
+    
+    p <- ggplot(tsne_coords, aes(x = tSNE1, y = tSNE2, color = marker)) +
+        geom_point(size = 0.5, alpha = 0.6) +
+        scale_color_gradientn(colors = c("blue", "cyan", "yellow", "red")) +
+        theme_classic() +
+        ggtitle(marker_name) +
+        theme(legend.position = "right")
+    
+    plot_list[[i]] <- p
+}
+grid.arrange(grobs = plot_list, ncol = 3)
+dev.off()
+```
+
+## 8. Export Results
+
+```r
+# Create results directory
+dir.create("results", showWarnings = FALSE)
+
+# Export cluster assignments
+results_df <- data.frame(
+    CellID = 1:length(sample_idx),
+    Cluster = clusters,
+    tSNE1 = tsne_coords$tSNE1,
+    tSNE2 = tsne_coords$tSNE2,
+    UMAP1 = umap_coords$UMAP1,
+    UMAP2 = umap_coords$UMAP2
+)
+
+write.csv(results_df, "results/cluster_assignments.csv", row.names = FALSE)
+
+# Export cluster statistics
+cluster_stats <- data.frame(
+    Cluster = 1:max(clusters),
+    Count = as.vector(cluster_freq),
+    Percentage = as.vector(cluster_pct)
+)
+
+write.csv(cluster_stats, "results/cluster_statistics.csv", row.names = FALSE)
+
+# Export mean marker expression per cluster
+write.csv(cluster_means, "results/cluster_mean_expression.csv")
+
+# Save R workspace
+save.image("results/cytof_analysis_workspace.RData")
+
+print("Analysis complete! Results saved in 'results' and 'QC_plots' directories.")
+```
+
+## 9. Advanced Analysis (Optional)
+
+```r
+# Differential expression between clusters
+# Example: Compare cluster 1 vs cluster 2
+compare_clusters <- function(cluster1, cluster2, data, markers) {
+    cells1 <- clusters == cluster1
+    cells2 <- clusters == cluster2
+    
+    pvalues <- numeric(length(markers))
+    fold_changes <- numeric(length(markers))
+    
+    for(i in 1:length(markers)) {
+        marker_idx <- markers[i]
+        expr1 <- data[sample_idx[cells1], marker_idx]
+        expr2 <- data[sample_idx[cells2], marker_idx]
+        
+        # Wilcoxon test
+        pvalues[i] <- wilcox.test(expr1, expr2)$p.value
+        
+        # Fold change (mean difference)
+        fold_changes[i] <- mean(expr1) - mean(expr2)
+    }
+    
+    results <- data.frame(
+        Marker = colnames(data)[markers],
+        Pvalue = pvalues,
+        FDR = p.adjust(pvalues, method = "BH"),
+        FoldChange = fold_changes
+    )
+    
+    return(results)
+}
+
+# Example usage
+# de_results <- compare_clusters(1, 2, expr_transformed, clustering_cols)
+# write.csv(de_results, "results/differential_expression_cluster1_vs_cluster2.csv", row.names = FALSE)
+```
+
+## Summary
+
+This pipeline provides:
+1. **Data import and preprocessing** - Loading FCS files, filtering doublets and dead cells
+2. **Quality control** - Signal distribution plots and summary statistics
+3. **Dimensionality reduction** - t-SNE and UMAP
+4. **Clustering** - FlowSOM-based cell population identification
+5. **Visualization** - Multiple plot types for data exploration
+6. **Export** - Results saved for downstream analysis
+
+**Key parameters to adjust:**
+- `clustering_markers`: Update with your specific panel
+- `nClus`: Number of clusters (default 20)
+- Transformation cofactor (default 5)
+- Thresholds for doublet/dead cell removal

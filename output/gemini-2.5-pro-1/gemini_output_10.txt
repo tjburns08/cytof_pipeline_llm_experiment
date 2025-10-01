@@ -1,0 +1,224 @@
+Of course. Here is a comprehensive, step-by-step CyTOF analysis pipeline for a single FCS file, primarily using the R programming language and popular Bioconductor packages.
+
+This pipeline is designed to be a practical template that takes you from a raw FCS file to annotated cell populations and visualizations.
+
+### **Analysis Goal**
+
+The goal with a single file is **discovery**: to identify the different cell populations present in that sample, characterize them by their protein markers, and quantify their relative abundances.
+
+### **Core Tools**
+
+We will primarily use R and packages from Bioconductor, which is the standard for flow and mass cytometry analysis.
+
+*   **`flowCore`**: For basic handling of FCS files (reading, compensating).
+*   **`CATALYST`**: A modern, comprehensive framework for mass cytometry analysis. It simplifies many steps like clustering, dimensionality reduction, and visualization.
+*   **`ggplot2` & `pheatmap`**: For customizable plotting.
+
+---
+
+### **Pipeline: Step-by-Step with R Code**
+
+### **Step 0: Prerequisites & Setup**
+
+First, you need to install the necessary R packages.
+
+```R
+# Install BiocManager if you don't have it
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# Install required packages
+BiocManager::install(c("flowCore", "CATALYST", "scater"))
+install.packages(c("ggplot2", "pheatmap", "readr"))
+
+# Load the libraries for your session
+library(flowCore)
+library(CATALYST)
+library(ggplot2)
+library(readr)
+```
+
+### **Step 1: Data Loading and Initial Inspection**
+
+We start by loading your FCS file and creating the necessary metadata files (panel and sample metadata).
+
+1.  **Place your file:** Put your `.fcs` file in your R working directory. For this example, we'll call it `sample01.fcs`.
+2.  **Load the FCS file**: We use `flowCore` to read the file into a `flowFrame` object.
+
+```R
+# Define the file name
+fcs_file <- "sample01.fcs"
+
+# Read the FCS file into a flowFrame
+ff <- read.FCS(fcs_file, transformation = FALSE, truncate_max_range = FALSE)
+ff
+```
+
+3.  **Create a Panel File**: The panel file maps the FCS channel names (e.g., `Di141`, `In115`) to meaningful marker names (e.g., `CD45`, `CD3`). This is crucial for interpretation.
+
+```R
+# Create a data frame for your panel
+# You MUST adapt this to your specific experiment
+panel_data <- data.frame(
+    fcs_colname = colnames(ff),
+    marker_name = c("Time", "Event_length", "DNA1", "DNA2", "CD45", "CD3", "CD4", "CD8a", "CD19", "CD56", "Cisplatin", "Bead1", "Bead2"), # Example names
+    marker_class = c("none", "none", "state", "state", "type", "type", "type", "type", "type", "type", "state", "none", "none") # 'type' = lineage/cell type marker; 'state' = functional/state marker
+)
+
+# Write to a CSV file
+write_csv(panel_data, "panel.csv")
+```
+***Note:*** `marker_class` tells `CATALYST` which markers to use for clustering (`type`) and which are for other purposes (`state` like viability, or `none` like beads/time).
+
+4.  **Create a Metadata File**: This file contains information about your sample(s). For one file, it's simple.
+
+```R
+# Create a metadata data frame
+metadata <- data.frame(
+    file_name = fcs_file,
+    sample_id = "Sample01",
+    condition = "Baseline" # e.g., 'Healthy', 'Treated', etc.
+)
+
+# Write to a CSV file
+write_csv(metadata, "metadata.csv")
+```
+
+### **Step 2: Preprocessing**
+
+This stage cleans the data to ensure high quality for downstream analysis.
+
+1.  **(Optional but Recommended) Bead Normalization**: If your data wasn't normalized on the instrument, you should normalize it to correct for signal drift over time using normalization beads. The `premessa` package is excellent for this, but it is an advanced step. For simplicity here, we assume it was done by the CyTOF instrument software.
+
+2.  **Compensation (Spillover Correction)**: CyTOF has less spillover than fluorescence, but it's not zero. You must compensate to correct for signal from one mass channel spilling into another. The spillover matrix is usually included in the FCS file or provided as a separate CSV.
+
+```R
+# Look for the spillover matrix in the FCS file keywords
+spill_matrix <- ff@description$SPILL
+
+if (!is.null(spill_matrix)) {
+    # Apply the compensation
+    ff_comp <- compensate(ff, spill_matrix)
+    print("Compensation applied from FCS file metadata.")
+} else {
+    # If not in the FCS, you might load it from a CSV (e.g., from Cytobank)
+    # spill_csv <- read.csv("spillover_matrix.csv", row.names = 1)
+    # ff_comp <- compensate(ff, spill_csv)
+    print("No spillover matrix found. Skipping compensation.")
+    ff_comp <- ff # Proceed without compensation
+}
+```
+
+3.  **Gating to Remove Unwanted Events**: This is a **critical** step. You must remove non-cellular events before analysis.
+    *   **Beads**: Remove normalization beads.
+    *   **Debris**: Remove low-DNA-content events.
+    *   **Doublets**: Remove cell aggregates (doublets).
+    *   **Dead cells**: Remove dead cells (e.g., using Cisplatin).
+
+While this can be scripted, it's often more practical and reliable to perform this initial cleanup gating **interactively** in software like **FlowJo** or **Cytobank**, and then **export a new, cleaned FCS file**.
+
+**For this pipeline, we will assume you have done this and are starting from a `sample01_cleaned.fcs` file.** The rest of the pipeline will use this cleaned file.
+
+### **Step 3: Unsupervised Analysis with `CATALYST`**
+
+Now for the core analysis where we discover cell populations.
+
+1.  **Prepare Data for CATALYST**: We'll use `prepData` to load the cleaned FCS file and link it with our panel and metadata, creating a `SingleCellExperiment` object.
+
+```R
+# Assuming you now have a cleaned file
+cleaned_fcs <- "sample01_cleaned.fcs"
+
+# Load the panel and metadata files we created earlier
+panel <- read.csv("panel.csv")
+md <- read.csv("metadata.csv")
+
+# Update metadata to point to the cleaned file
+md$file_name <- cleaned_fcs
+
+# Create the SingleCellExperiment object
+sce <- prepData(md$file_name, panel, md, features = panel$fcs_colname)
+
+# Apply an arcsinh transformation (standard for CyTOF)
+# cofactor of 5 is a common choice
+sce <- sce[rowData(sce)$marker_class != "none", ] # Remove non-marker channels
+sce <- normCytof(sce, k = "all", cofactor = 5)
+```
+
+2.  **Dimensionality Reduction (UMAP)**: We project the high-dimensional data into 2D for visualization. UMAP is currently preferred over t-SNE as it better preserves global data structure.
+
+```R
+# Run UMAP on the 'type' markers (used to define cell populations)
+set.seed(123) # for reproducibility
+sce <- runDR(sce, dr = "UMAP", cells = 2000, features = "type") # Using 2000 cells for speed
+```
+
+3.  **Clustering (FlowSOM)**: We group cells into clusters based on their marker expression profiles. `FlowSOM` is fast and robust.
+
+```R
+# Cluster using FlowSOM on 'type' markers
+set.seed(123)
+sce <- cluster(sce, features = "type", xdim = 10, ydim = 10, maxK = 20, seed = 123)
+# maxK = 20 suggests we expect around 20 final populations. Adjust as needed.
+```
+
+### **Step 4: Visualization and Interpretation**
+
+This is where we make sense of the results.
+
+1.  **Visualize UMAP by Cluster**: Plot the UMAP and color the cells by the clusters we just identified.
+
+```R
+# Plot the UMAP, colored by FlowSOM cluster ID
+plotDR(sce, "UMAP", color_by = "meta20") # 'meta20' is the name CATALYST gives the clustering result
+```
+This plot shows you the spatial arrangement of your cell clusters.
+
+2.  **Visualize Marker Expression on UMAP**: To understand what each cluster *is*, we plot the UMAP again, but color by the expression of key markers.
+
+```R
+# Get the names of your 'type' markers
+type_markers <- c("CD45", "CD3", "CD4", "CD8a", "CD19", "CD56") # From your panel
+
+# Plot marker expression on the UMAP
+plotDR(sce, "UMAP", color_by = type_markers)
+```
+This will generate a series of UMAP plots. For example, the plot for "CD19" will highlight the B-cell cluster in hot colors.
+
+3.  **Expression Heatmap**: This is the most important visualization for annotating clusters. It shows the median expression of each marker across all identified clusters.
+
+```R
+# Plot a heatmap of median marker expression per cluster
+plotExprHeatmap(sce, features = "type", by = "cluster_id", k = "meta20",
+                scale = "last", bars = TRUE, perc = TRUE)
+```
+*   **How to read the heatmap**: Look down the columns. A cluster that is "hot" (e.g., red/yellow) for CD3, CD8, and CD45, but "cold" (blue) for CD19 and CD4, is a **CD8+ T-cell**. Use this logic to assign a biological name to each cluster ID.
+
+### **Step 5: Quantification**
+
+The final step is to quantify the results.
+
+```R
+# Get the frequencies of each cluster
+plotAbundances(sce, k = "meta20", by = "sample_id")
+
+# You can also get the raw counts as a table
+cluster_counts <- table(colData(sce)$cluster_id, colData(sce)$sample_id)
+cluster_freqs <- prop.table(cluster_counts, margin = 2) * 100 # Frequencies as percentage
+
+print("Cluster Frequencies (%):")
+print(cluster_freqs)
+```
+
+---
+
+### **Summary of the Workflow**
+
+1.  **Setup**: Install and load R packages.
+2.  **Load Data**: Read the FCS file and create panel/metadata files.
+3.  **Preprocess**: Compensate for spillover and (critically) gate out beads, debris, doublets, and dead cells (often done in FlowJo/Cytobank).
+4.  **Analyze**: Use `CATALYST` to transform data, run UMAP for visualization, and run FlowSOM for clustering.
+5.  **Interpret**: Use UMAPs and expression heatmaps to assign biological identities to your clusters (e.g., "Cluster 5 is CD4+ T-cells").
+6.  **Quantify**: Calculate the percentage of each cell population in your sample.
+
+This pipeline provides a robust and reproducible framework for analyzing a single CyTOF sample, forming the foundation for more complex multi-sample experiments.

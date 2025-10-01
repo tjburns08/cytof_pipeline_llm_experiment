@@ -1,0 +1,140 @@
+Below is a high-level CyTOF (Cytometry by Time-Of-Flight) analysis pipeline for processing and analyzing a single FCS (Flow Cytometry Standard) file. CyTOF data analysis typically involves preprocessing, normalization, clustering, and visualization steps. I'll provide this as a Python script using popular open-source libraries: `pandas` for data handling, `fcsparser` for reading FCS files, `scipy` for transformations, and `flowkit` (a comprehensive Python library for flow cytometry analysis). If you prefer R (e.g., using `flowCore` and `cytofkit`), let me know for an alternative.
+
+### Prerequisites
+- Install required Python libraries:  
+  ```
+  pip install fcsparser pandas numpy scipy flowkit scikit-learn umap-learn matplotlib seaborn
+  ```
+- Ensure your FCS file is from a CyTOF experiment (e.g., contains metal isotope channels like Cd, Ir, etc.).
+- This pipeline assumes a basic setup; customize it based on your data (e.g., specific markers).
+
+### Pipeline Overview
+1. **Load the FCS file**: Parse the data into a DataFrame.
+2. **Preprocessing**: Apply arcsinh transformation (common for CyTOF to handle high dynamic range).
+3. **Bead Normalization**: Optional but recommended for CyTOF to correct for instrument variability (using EQ beads if present).
+4. **Gating**: Remove debris, doublets, and dead cells based on common channels (e.g., DNA intercalators like Ir191/193, Event_length).
+5. **Clustering**: Use FlowSOM or Phenograph for cell population identification.
+6. **Dimensionality Reduction and Visualization**: Apply UMAP or t-SNE for plotting.
+7. **Output**: Save results (e.g., clustered data, plots).
+
+### Python Script for Single-File CyTOF Analysis
+Save this as `cytof_pipeline.py` and run it with `python cytof_pipeline.py your_file.fcs`.
+
+```python
+import fcsparser
+import pandas as pd
+import numpy as np
+from scipy.stats import arcsinh
+import flowkit as fk
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans  # Simple clustering; replace with FlowSOM if installed
+import umap
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+warnings.filterwarnings('ignore')  # Suppress non-critical warnings
+
+# Step 1: Load FCS file
+def load_fcs(file_path):
+    meta, data = fcsparser.parse(file_path, reformat_meta=True)
+    df = pd.DataFrame(data)
+    print(f"Loaded data with {df.shape[0]} events and {df.shape[1]} channels.")
+    return df, meta
+
+# Step 2: Preprocessing (arcsinh transformation)
+def preprocess_data(df, cofactor=5, channels_to_transform=None):
+    if channels_to_transform is None:
+        # Assume all non-time/event channels need transformation (common in CyTOF)
+        channels_to_transform = [col for col in df.columns if col not in ['Time', 'Event_length']]
+    
+    for col in channels_to_transform:
+        df[col] = np.arcsinh(df[col] / cofactor)
+    print("Applied arcsinh transformation.")
+    return df
+
+# Step 3: Bead Normalization (simple version; use full tools like Premessa for advanced)
+def bead_normalization(df, bead_channel='Ce140Di', bead_threshold=1):  # Example: Ce140 for EQ beads
+    if bead_channel in df.columns:
+        beads = df[df[bead_channel] > bead_threshold]
+        non_beads = df[df[bead_channel] <= bead_threshold]
+        # Simple normalization: subtract median bead intensity (customize as needed)
+        for col in non_beads.columns:
+            if col != bead_channel:
+                non_beads[col] -= beads[col].median()
+        print(f"Normalized using {len(beads)} bead events.")
+        return non_beads
+    else:
+        print("Bead channel not found; skipping normalization.")
+        return df
+
+# Step 4: Gating (basic: remove debris, doublets, dead cells)
+def gate_data(df):
+    # Example gates (adjust thresholds based on your data)
+    df = df[df['Event_length'] < 50]  # Remove long events (debris/doublets)
+    df = df[(df['Ir191Di'] > 1) & (df['Ir193Di'] > 1)]  # DNA+ live cells
+    print(f"Gated data: {df.shape[0]} events remaining.")
+    return df
+
+# Step 5: Clustering (using KMeans as example; install flowsom for better results)
+def cluster_data(df, channels, n_clusters=10):
+    scaler = StandardScaler()
+    data_scaled = scaler.fit_transform(df[channels])
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    df['Cluster'] = kmeans.fit_predict(data_scaled)
+    print(f"Clustered into {n_clusters} groups.")
+    return df
+
+# Step 6: Dimensionality Reduction and Visualization
+def visualize(df, channels, output_dir='output'):
+    reducer = umap.UMAP(random_state=42)
+    embedding = reducer.fit_transform(df[channels])
+    df['UMAP1'] = embedding[:, 0]
+    df['UMAP2'] = embedding[:, 1]
+    
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(x='UMAP1', y='UMAP2', hue='Cluster', data=df, palette='tab10', s=5)
+    plt.title('UMAP of Clustered CyTOF Data')
+    plt.savefig(f'{output_dir}/umap_plot.png')
+    print("Saved UMAP plot.")
+
+# Main pipeline function
+def run_pipeline(file_path, output_csv='processed_data.csv', n_clusters=10):
+    df, meta = load_fcs(file_path)
+    
+    # Select channels for analysis (exclude metadata like Time)
+    analysis_channels = [col for col in df.columns if col not in ['Time', 'Event_length', 'Cluster', 'UMAP1', 'UMAP2']]
+    
+    df = preprocess_data(df, channels_to_transform=analysis_channels)
+    df = bead_normalization(df)
+    df = gate_data(df)
+    df = cluster_data(df, analysis_channels, n_clusters=n_clusters)
+    visualize(df, analysis_channels)
+    
+    df.to_csv(output_csv, index=False)
+    print(f"Pipeline complete. Output saved to {output_csv}.")
+
+# Example usage
+if __name__ == "__main__":
+    import sys
+    if len(sys.argv) < 2:
+        print("Usage: python cytof_pipeline.py <path_to_fcs_file>")
+        sys.exit(1)
+    run_pipeline(sys.argv[1])
+```
+
+### How to Use
+1. Replace `<path_to_fcs_file>` with your actual FCS file path (e.g., `sample.fcs`).
+2. Customize parameters:
+   - `cofactor` in `preprocess_data` (default 5 for CyTOF).
+   - Bead channel and threshold in `bead_normalization`.
+   - Gating thresholds in `gate_data` (visualize histograms first to set these).
+   - Number of clusters in `cluster_data`.
+   - For advanced clustering, install `flowsom` (via `pip install flowsom`) and replace KMeans.
+3. Run the script: It will output a CSV with processed data, clusters, and a UMAP plot.
+
+### Notes and Limitations
+- **Customization**: CyTOF data varies; inspect your metadata (`meta` variable) for channel names and adjust accordingly. Use tools like FlowJo or Cytobank for interactive gating if needed.
+- **Advanced Tools**: For production use, consider R packages like `cytofkit` or `CATALYST` for more robust bead normalization and clustering (e.g., FlowSOM, Phenograph).
+- **Performance**: For large files (>1M events), subsample data or use GPU-accelerated libraries.
+- **Validation**: Always validate results biologically (e.g., check marker expression in clusters).
+- If this doesn't fit your needs (e.g., specific software or steps), provide more details!

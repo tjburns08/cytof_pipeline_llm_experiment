@@ -1,0 +1,183 @@
+Below is an end-to-end, single-file CyTOF analysis pipeline in R. It covers reading one FCS, optional QC, basic cleanup (beads/debris/doublets/dead), transformation, dimensionality reduction, clustering, and exporting results.
+
+What you need
+- R packages: CATALYST, flowCore, SingleCellExperiment, FlowSOM, scater, uwot, ggplot2, dplyr (optional: PeacoQC for automated QC)
+- One FCS file
+- A panel CSV describing channels and markers with columns:
+  - fcs_colname: exact FCS channel names (e.g., Ce140Di, Ir191Di, Ir193Di, CD3, etc.)
+  - antigen: human-readable marker names (e.g., Bead, DNA1, DNA2, CD3, CD4, CD8, etc.)
+  - marker_class: type for lineage/identity markers, state for functional markers, none for bead/DNA/viability/time/etc.
+
+Notes and assumptions
+- Many instruments already perform bead normalization; if not, normalize first using vendor tools or the Nolan Lab normalizer (see CATALYST vignette). For one file, you can often skip batch correction.
+- If your file is sample-barcoded, add a debarcoding step before clustering (CATALYST supports this).
+- Set channel names (beads, DNA, viability) to match your FCS.
+
+R script (copy-paste and edit the config section)
+--------------------------------------------------
+# Install packages if needed:
+# install.packages(c("BiocManager","uwot","ggplot2","dplyr"))
+# BiocManager::install(c("CATALYST","flowCore","SingleCellExperiment","FlowSOM","scater"))
+# Optional QC:
+# BiocManager::install("PeacoQC")
+
+library(CATALYST)
+library(flowCore)
+library(SingleCellExperiment)
+library(FlowSOM)
+library(scater)
+library(uwot)
+library(ggplot2)
+library(dplyr)
+# library(PeacoQC) # optional
+
+set.seed(1234)
+
+# 0) Configuration – EDIT THESE FOR YOUR DATA
+config <- list(
+  fcs_file      = "path/to/your_file.fcs",
+  panel_csv     = "path/to/panel.csv",
+  outdir        = "cytof_output_onefile",
+  cofactor      = 5,                  # arcsinh cofactor commonly 5 for CyTOF
+  bead_ch       = "Ce140Di",          # set to NA if no bead channel or beads already removed
+  dna1_ch       = "Ir191Di",
+  dna2_ch       = "Ir193Di",
+  viability_ch  = "Pt195Di",          # set to NA if you don't have cisplatin/viability
+  umap_n_neighbors = 15,
+  umap_min_dist    = 0.2,
+  flowSOM_grid     = c(10,10),        # SOM grid x/y
+  metaK            = 20               # target number of meta-clusters
+)
+
+dir.create(config$outdir, showWarnings = FALSE, recursive = TRUE)
+
+# 1) Load panel and data
+panel <- read.csv(config$panel_csv, stringsAsFactors = FALSE)
+stopifnot(all(c("fcs_colname","antigen","marker_class") %in% colnames(panel)))
+
+fs <- read.flowSet(
+  files = config$fcs_file,
+  transformation = FALSE,
+  truncate_max_range = FALSE
+)
+
+# Simple metadata for one file
+md <- data.frame(
+  file_name = basename(config$fcs_file),
+  sample_id = tools::file_path_sans_ext(basename(config$fcs_file)),
+  condition = "sample",
+  stringsAsFactors = FALSE
+)
+
+# 2) Build SingleCellExperiment with arcsinh transform
+sce <- CATALYST::prepData(
+  fs, panel = panel, md = md, cofactor = config$cofactor
+)
+
+# 3) Optional automated acquisition QC (remove spikes/drifts)
+# If you want automated anomaly removal, uncomment and set "qc_channels".
+# qc_channels <- panel$fcs_colname[panel$marker_class %in% c("type","state")]
+# res_qc <- PeacoQC::PeacoQC(flowFrame(sce), channels = qc_channels, save_fcs = FALSE)
+# sce <- CATALYST::prepData(flowCore::flowSet(res_qc$FinalFF), panel = panel, md = md, cofactor = config$cofactor)
+
+# 4) Cleanup: beads, DNA/doublets, dead cells
+# 4a) Remove normalization beads if present
+if (!is.na(config$bead_ch) && config$bead_ch %in% panel$fcs_colname) {
+  sce <- CATALYST::removeBeads(sce, beads = config$bead_ch)
+}
+
+# 4b) Remove doublets using DNA channels
+if (all(c(config$dna1_ch, config$dna2_ch) %in% panel$fcs_colname)) {
+  sce <- CATALYST::removeDoublets(sce, dna1 = config$dna1_ch, dna2 = config$dna2_ch)
+}
+
+# 4c) Remove dead cells (viability high = dead). If no viability channel, skip.
+if (!is.na(config$viability_ch) && config$viability_ch %in% panel$fcs_colname) {
+  # Adaptive threshold: gate out top tail of viability signal
+  v <- assay(sce, "exprs")[config$viability_ch, ]
+  thr <- quantile(v, 0.99, na.rm = TRUE) # conservative; adjust as needed
+  keep <- v < thr
+  sce <- sce[, keep]
+}
+
+# 5) Select features for DR and clustering
+lineage_markers <- panel$antigen[panel$marker_class == "type"]
+lineage_markers <- lineage_markers[lineage_markers %in% rownames(sce)]
+
+# 6) Dimensionality reduction
+sce <- CATALYST::runDR(
+  sce, dr = "UMAP", cells = ncol(sce),
+  features = lineage_markers,
+  args = list(n_neighbors = config$umap_n_neighbors, min_dist = config$umap_min_dist, metric = "euclidean")
+)
+
+# 7) Clustering using FlowSOM + meta-clustering
+sce <- CATALYST::cluster(
+  sce,
+  features = lineage_markers,
+  xdim = config$flowSOM_grid[1], ydim = config$flowSOM_grid[2],
+  maxK = config$metaK,
+  seed = 1234, verbose = TRUE
+)
+
+# Choose a single clustering resolution (meta-clustering) to use downstream
+# Common to use the requested metaK; CATALYST stores "metaX" labels in colData
+chosenK <- config$metaK
+cluster_col <- paste0("meta", chosenK)
+colData(sce)$cluster_id <- colData(sce)[[cluster_col]]
+
+# 8) Quick plots (saved to disk)
+pdf(file.path(config$outdir, "umap_clusters.pdf"), width = 7, height = 6)
+CATALYST::plotDR(sce, "UMAP", color_by = "cluster_id")
+dev.off()
+
+pdf(file.path(config$outdir, "cluster_heatmap_lineage.pdf"), width = 8, height = 8)
+CATALYST::plotClusterHeatmap(
+  sce,
+  features = lineage_markers,
+  k = cluster_col,
+  fun = "median",
+  draw_freqs = TRUE,
+  scale = TRUE
+)
+dev.off()
+
+# 9) Export results
+saveRDS(sce, file.path(config$outdir, "sce.rds"))
+
+# Event-level table: cluster, UMAP, select markers
+umap <- reducedDim(sce, "UMAP")
+evt <- data.frame(
+  event_id = seq_len(ncol(sce)),
+  sample_id = colData(sce)$sample_id,
+  cluster_id = colData(sce)$cluster_id,
+  UMAP1 = umap[, 1],
+  UMAP2 = umap[, 2],
+  t(assay(sce, "exprs")[lineage_markers, , drop = FALSE])
+)
+write.csv(evt, file.path(config$outdir, "events_with_clusters_and_umap.csv"), row.names = FALSE)
+
+# Cluster-level summaries: counts and medians
+clust_counts <- as.data.frame(table(evt$cluster_id)) |> dplyr::rename(cluster_id = Var1, n = Freq)
+write.csv(clust_counts, file.path(config$outdir, "cluster_counts.csv"), row.names = FALSE)
+
+cluster_medians <- evt |>
+  dplyr::group_by(cluster_id) |>
+  dplyr::summarise(dplyr::across(all_of(lineage_markers), median), .groups = "drop")
+write.csv(cluster_medians, file.path(config$outdir, "cluster_marker_medians.csv"), row.names = FALSE)
+
+cat("Done. Outputs written to:", normalizePath(config$outdir), "\n")
+
+Optional additions
+- Debarcoding (if your file is a pooled barcoded sample):
+  - Use CATALYST functions assignPrelim(), estCutoffs(), applyCutoffs() prior to cleanup and clustering.
+- Bead normalization:
+  - If your file is not normalized, normalize using instrument software or the Nolan Lab normalizer. CATALYST provides a wrapper in its vignette; normalize the raw FCS on disk first, then run this pipeline on the normalized file.
+- Alternative QC:
+  - PeacoQC for acquisition anomalies; flowAI as another option.
+- Alternative clustering:
+  - Phenograph (Rphenograph) or Leiden (via scanpy in Python). FlowSOM is fast and standard for CyTOF.
+- Annotation:
+  - Use median heatmaps and marker enrichment modeling (MEM) to assign biological labels to clusters.
+
+If you share your panel CSV (first rows) and the key channel names for beads/DNA/viability, I can tailor the config and thresholds precisely for your file.

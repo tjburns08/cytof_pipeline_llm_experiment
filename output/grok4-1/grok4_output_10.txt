@@ -1,0 +1,119 @@
+Below is a basic CyTOF (Cytometry by Time-of-Flight) analysis pipeline for processing and analyzing a single FCS file (the standard format for CyTOF data). This pipeline assumes you're working in R, as it's a popular environment for cytometry data analysis with robust packages like those from Bioconductor. If you prefer Python (e.g., using libraries like FlowCal or Cytoflow), let me know for an alternative.
+
+### Prerequisites
+- Install R (version 4.0+ recommended) and RStudio for an IDE.
+- Install required Bioconductor packages:
+  ```
+  if (!requireNamespace("BiocManager", quietly = TRUE))
+      install.packages("BiocManager")
+  BiocManager::install(c("flowCore", "flowViz", "flowStats", "CytoML", "CATALYST"))
+  ```
+- You'll need a single CyTOF FCS file (e.g., `sample.fcs`). If your data is in a different format, convert it to FCS first using tools like FlowJo or the instrument software.
+
+### Pipeline Overview
+This pipeline includes:
+1. **Data Import and Preprocessing**: Load the file, compensate for spillover (if needed), and transform data.
+2. **Quality Control (QC)**: Check for anomalies like bead removal or dead cell exclusion.
+3. **Gating and Normalization**: Basic gating and arcsinh transformation (common for CyTOF).
+4. **Clustering and Visualization**: Dimensionality reduction (e.g., UMAP) and clustering (e.g., FlowSOM).
+5. **Differential Analysis**: Simple comparison if you have metadata (e.g., stimulated vs. control).
+6. **Export Results**: Save plots and processed data.
+
+This is a high-level, customizable pipeline. Adjust parameters based on your specific experiment (e.g., markers for T cells, cytokines).
+
+### R Script for the Pipeline
+Copy-paste this into an R script and run it step-by-step. Comments explain each part.
+
+```r
+# Load libraries
+library(flowCore)
+library(flowViz)
+library(flowStats)
+library(CytoML)
+library(CATALYST)
+library(ggplot2)
+library(umap)
+library(FlowSOM)
+
+# Step 1: Import the FCS file
+fcs_file <- "path/to/your/sample.fcs"  # Replace with your file path
+fcs <- read.FCS(fcs_file, transformation = FALSE)  # Load without auto-transformation
+
+# Print summary to inspect
+print(keyword(fcs))  # Metadata
+print(exprs(fcs)[1:5,])  # First few rows of expression data
+
+# Step 2: Preprocessing
+# Arcsinh transformation (common for CyTOF to handle high dynamic range)
+# Cofactor of 5 is standard for protein markers; adjust for DNA/others
+trans <- arcsinhTransform(a = 0, b = 1/5, c = 0)
+fcs_trans <- transform(fcs, trans)
+
+# Compensation (if spillover matrix is available; skip if pre-compensated)
+# Assume you have a spillover matrix in a CSV file
+# spillover_matrix <- read.csv("path/to/spillover.csv", row.names = 1)
+# comp <- spillover_compensate(fcs_trans, spillover_matrix)
+
+# Bead normalization (if beads are in data)
+# fcs_norm <- normCytof(fcs_trans, beads = "dvs")  # Uses CATALYST; adjust bead channel
+
+# Step 3: Quality Control
+# Plot density to check for anomalies (e.g., dead cells via viability marker)
+densityplot(~`Ir191Di`, fcs_trans, main = "DNA Stain Density (Ir191)")
+
+# Filter out low-quality events (e.g., remove doublets or dead cells)
+# Assume 'Viability' is a marker; adjust based on your panel
+fcs_filtered <- Subset(fcs_trans, fcs_trans@exprs[, "Viability"] > 1)  # Example threshold
+
+# Step 4: Gating (manual or automated)
+# Example: Gate on live singlets
+# Use flowStats for automated gating if needed
+rectGate <- rectangleGate(filterId = "live_singlets", "FSC-A" = c(100, Inf), "Viability" = c(1, Inf))  # Adjust channels
+fcs_gated <- Subset(fcs_filtered, rectGate)
+
+# Step 5: Clustering and Dimensionality Reduction
+# Select markers for analysis (exclude technical channels like Time, Event_length)
+markers <- grep("Di$", colnames(fcs_gated), value = TRUE)  # Assuming metal-tagged channels end with 'Di'
+expr_data <- exprs(fcs_gated)[, markers]
+
+# FlowSOM clustering
+fsom <- ReadInput(fcs_gated, transform = FALSE, scale = FALSE)
+fsom <- BuildSOM(fsom, colsToUse = markers)
+fsom <- BuildMST(fsom)  # Build minimum spanning tree
+meta_clusters <- MetaClustering_consensus(fsom$map$codes, k = 20)  # 20 meta-clusters; adjust k
+
+# UMAP for visualization
+umap_res <- umap(expr_data)
+umap_df <- data.frame(UMAP1 = umap_res$layout[,1], UMAP2 = umap_res$layout[,2], Cluster = meta_clusters)
+ggplot(umap_df, aes(UMAP1, UMAP2, color = factor(Cluster))) + 
+  geom_point() + theme_minimal() + ggtitle("UMAP of CyTOF Clusters")
+
+# Step 6: Differential Analysis (if you have sample metadata)
+# Example: Assume metadata with 'condition' (e.g., control vs. treated)
+md <- data.frame(file = fcs_file, condition = "control")  # Expand for multiple files
+sce <- prepData(fcs_gated)  # Convert to SingleCellExperiment for CATALYST
+sce <- cluster(sce, features = markers, xdim = 10, ydim = 10, maxK = 20)
+# Run differential abundance (DA) if comparing groups
+da_res <- testDA_edgeR(sce, md$condition)  # Requires multiple samples for stats
+
+# Step 7: Export Results
+# Save plots
+ggsave("umap_clusters.png", last_plot())
+# Save processed FCS
+write.FCS(fcs_gated, "processed_sample.fcs")
+# Save cluster assignments
+write.csv(cbind(expr_data, Cluster = meta_clusters), "cluster_results.csv")
+
+# End of pipeline
+print("Analysis complete!")
+```
+
+### Key Notes
+- **Customization**: CyTOF panels vary (e.g., immune cell markers like CD3, CD4). Update `markers` and gates accordingly. If your file includes compensation info in the metadata, use `compensate()` from flowCore.
+- **Scalability**: This is for one file. For multiple files, use `flowSet` instead of a single flowFrame, and tools like CATALYST for batch processing.
+- **Performance**: Large CyTOF files (millions of events) may require downsampling or running on a server with more RAM.
+- **Troubleshooting**: If you encounter errors (e.g., missing channels), check your FCS file with `flowCore::summary(fcs)`. Ensure all channels are correctly named.
+- **Advanced Options**: For more sophisticated analysis, integrate with Seurat (for single-cell RNA-seq-like workflows) or use Cytosplore for interactive visualization.
+- **References**: Based on Bioconductor workflows (e.g., "CyTOF workflow" vignette in CATALYST). Consult the package docs for details.
+
+If this doesn't match your setup (e.g., you need Python code, specific markers, or focus on a particular analysis step), provide more details!

@@ -1,0 +1,248 @@
+#+Title: Package Harvest Notes
+#+Author: Tyler Burns
+#+Date: October 1, 2025
+#+Purpose: notes on the package harvest
+
+* GPT-5
+Iter 1:
+- There is more than one qc step that involves removing the 1% and 99%ile of each channel, or similar (see bullet point below on the beads channel).
+- There's a step around removing "extrme high" events in the beads channel.
+- There's a DNA gating step that I do not trust, and a live cell gating step. People who are new to the field might take this as gospel and mess it up. Better to use a gating interface. But the model does not say this.
+- There is a data.table bias and the walrus operator within. It's apparently much [[https://stackoverflow.com/questions/7029944/when-should-i-use-the-operator-in-data-table][faster]].
+- Does not mention to avoid using phospho markers for clustering.
+- possible hallucination, saying that "some workflows use a cofactor of 4 or 5"
+- offers an integrated workflow using CATALYST in the end
+
+Iter 2:
+- Some density function that I don't understand. Might be the attempt to "code away the gating." Similar can be said about extreme tail distribution functions, as in the previous.
+- A channel "clean names" function, using a "." at the start (.clean <- function) that I didn't know was a thing. Reminds me of Java's "public" versus "private" declarations that are required
+- Overengineers the "special channel" naming a bit, but nonetheless has a good sanity check print statement around "channels detected"
+- Has statements in the end clarifying the "overengineered" things above, including preferring using built in standard internal bead software
+- At the end, offers a python equivalent, though does not make it outright
+- Uses CATALYST package from the start
+
+Iter 3:
+- PeacoQC to deal with anomalies
+- Codes up the gates. I don't like. Makes assumptions around quantiles, etc.
+- Recommends diffcyt (or CATALYST) if >1 sample. We note here that perhaps we would see more diffcyt if we were using more than one file, but that will be a separate experiment.
+
+Iter 4:
+- Has TODO in the comments for where the user needs to do a thing. I like this.
+- Alternatives included directly in code (eg between premessa and CATALYST)
+- Another reference to density in the bead norm stuff. Perhaps there is something here that I simply don't know / have not had to deal with.
+- Overengineered gating (eg function called find_bimodal_cut). I've never had to deal with this kind of thing, because we gate using gating softare.
+- data.table used again, but not exclusively
+- Output is writing a fcs with new stuff in there, rather than writing a csv.
+- Offers python as alternative, but concedes that R is the most mature for CyTOF. Says that scanpy is possibel with CyTOF data?
+
+Iter 5
+- the use of data.table again
+- fwrite
+- gaussian mixture models in gating
+
+Iter 6
+- config list at the top, nice way to organize
+- the choice of pdfs for output was unique
+- the use of the |> pipe operator, didn't know it was a thing
+- commentary says that Phenograph or Leiden (via scanpy!) is an alternative to FlowSOM
+
+Iter 7
+- I note that there might have to be "Human checks" after the attempts to automate the data prep and the gates, which might serve as decent shortcuts so you don't have to spend all your time in excel and FJ (of equivalent) down the line. But human-out-of-the-loop might be a challenge to do here.
+- suggests using 10 as a cofactor if your signals are too compressed or spread. This is a hallucination and it should rather read that too compressed should use a lower cofactor and too spread should use a higher cofactor.
+- Not familiar with the following way of fcs parsing via flow frame:
+#+begin_src R
+pn <- pData(param)
+channel_names <- as.character(pn$`$PnN`)
+marker_names  <- as.character(pn$`$PnS`)
+#+end_src
+
+Iter 8
+- an interesting function called safe_grep that it makes at the top
+- more quantile stuff, and the use of peacoQC
+- in flowsom, they build the MST. I note that this happens in the other iters too for the most part. But I note that I've never actually used the FlowSOM MST. I consider it to be legacy code back to SPADE, with a cool pie chart thing added to it.
+- it builds an abundance table for a heatmap. i'd have to go back and see if all the other iters do that. not that I remember.
+- it recommends gating using visual validation for publication-level results. i'm happy to see this disclaimer. again, I primarily use software like FJ or OMIQ for this.
+
+Iter 9
+- seed set to 42
+- not just this one: it offers to give it the complete panel info so it can go more specific with whatever your data are
+
+Iter 10
+- extreme event removal is 2 and 98th percentiles, not 1 and 99th percentiles, suggesting some wiggle room between workflows in the training data
+- an anomaly removal step in the time channel, which is something i have seen done in flow, but i've never done it for cytof
+- idea for followup: giving this an actual dataset and actually running each pipeline through.
+- similar ambiguous info around the asinh transform cofactor (if your data look compressed try 4-6)
+- suggests diffcuyt for >1 fcs file
+* Claude
+Iter 1
+- possible overengineered metal channel finder (assumes the number occurs before the letter)
+- redundancy between flowsom and concensusclusterplus
+- adds a differential expression analysis, even though its just one fcs file. has "optional" in parens
+- very organized compared to chatgpt
+- includes catalyst alternative directly in the result
+
+Iter 2
+- very similar in structure to output 1, but with usage instructions at the bottom
+- no catalyst alternative shown
+
+Iter 3
+- dimension reduction coming before clustering each time
+- less commentary compared to chatgpt
+- complete wrapper offered/provided in the end
+
+Iter 4
+- saving and summary reports are functions
+- tsne and umap are always used
+- qc function that includes things like doublet thresholding
+
+Iter 5
+- hard coded qc numbers rather than quantiles, be wary of this
+- offers sketch of differential abundance workflow, using diffcyt, for >1 fcs
+
+Iter 6
+- density and visualization qc plots set
+- subsampling for dimr here is 20k, but i've seen 10k and 50k in other iters (across everything)
+- includes a statistical tests between clusters step which reminds me of Seurat's FindAllMarkers. I have not seen that on any other iter than this one.
+- cute cell population identify function based on markers being above some expression levels that are hard coded (i'd prefer percentile)
+- they provide an export to Cytobank function. Another thing that I have not seen in other functions.
+- though hard coded, they tell you to customize at the bottom. it would help if they told you in the code where user input is needed, like that one iter in gpt5 where TODO flags were in the code comments
+
+Iter 7
+- has annotation helpers
+- has a section that suggests additional analysis, including pseudotime, which I did not see in the other iters or in gpt5
+- they start with catalyst as the default and then have a simplified pipeline that does not include catalyst
+
+Iter 8
+- has a R default workflow, but is the only one that ALSO includes a python workflow (we note that two Grok iters default to python without R)
+- has the consensusclusterplus direct metaclustering, as an alternative to the automatic flowsom version. not sure why this would be needed. seen only in the claude iters
+- includes violin plots of markers by clusters, similar to Seurat
+- the python workflow
+  - uses anndata
+  - runs pca before tsne and umap (not needed in my opinion)
+  - leiden clustering (closest in nature to phenograph)
+
+Iter 9
+- operates at the level of creating directories (like a qc directory)
+- 50k subsample for dimr
+- pdf as design choice
+- cluster freq barplot kinda cool
+- grid of dimr colored by whatever markers (seen in other iters too)
+- has the between-cluster expression analysis talked about before
+- tells you at the bottom what the user needs to adjust
+
+Iter 10
+- has a post-asinh "transformation check" visualization step, which I appreciate. Could probably have "print and visualize all of the things" as a design choice built into the context engineering
+- 42 as the seed number
+- pdf as design choice
+- cluster medians and heatmap before freqs, seen in >1 iter
+- an optional manual gating section that is overengineered in my opinion
+* Grok
+Iter 1:
+- uses "Fluidigm" rather than Standard BioTools as a company name
+- hallucinates that cytofkit is python
+- hallucinates a seurat object
+- the python alternative suggested would use HDBSCAN and UMAP for clustering (implying the use of HDBSCAN with UMAP coords as input)
+
+Iter 2:
+- has gating (literal, makerectanglegate, etc) built into pipeline
+- advises to refer to CyTOF Workflow, suggesting older training data weighing the model down
+
+Iter 3:
+- references Fluidigm Helios, suggesting the data are coming from this era
+- rectangle gating
+- uses cytofkit, suggests CATALYST, suggestive of era (cytofkit was deprecated)
+- has median expression per cluster, as comment, but no code beneath
+- suggests FJ, Cytobank and FCS Express once again speaking to an older era (pre OMIQ and CellCarta's CellEngine, or Astrolabe for that matter)
+
+Iter 4
+- hallucinates "cytofpy" package
+- in general for grok: more words, less code. might be suggestive of a "lesser model." gemini 2.5 flash lite was all words, no code, for example.
+
+Iter 5
+- seen in grok iters: "if you have memory issues, use a machine with more RAM." does not use more efficient things like data.table (though I don't know if that package in particular helps with ram or if its more just faster computation).
+- hallucinates a hyperlink to catalyst vignettes
+- hallucinates a cluster_codes function
+
+Iter 6
+- reads a flow set of size one and pulls the one flow frame out of it. unnecessary.
+- adds a rm(list = ls) cleanup step at the end. have not seen that anywhere else.
+- hallucinates cytofpy again
+
+Iter 7:
+- python only
+- choose kmeans for clustering, though it does suggest a flowsom python package for "advanced" clustering
+
+Iter 8:
+- hallucinates cytofkit as a python package again!
+- references Fluidigm not SBT
+
+Iter 9:
+- python only
+- does a z score (not recommended for cytof)
+- kmeans, recommends phenograph
+
+Iter 10:
+- hallucinates that its flow data, and there's a spillover matrix that needs to be compensated (not catalyst)
+- does clustering twice, redundant, laughable
+- uses a diffcyt function without loading diffcyt, and for one file (not needed, and wrong)
+- talks about integrating with Seurat (I've heard that before in these iters)
+* Gemini
+Iter 1:
+- holds your hand through the metadata file creation
+- hard coded 1-D gates around DNA and cell length
+- there is a manual annotation step based on the heatmap, with starter code laid out for you
+
+Iter 2:
+- holds your hand through the metadata again, but without the cool imagry from iter 1
+- spillover compensation via compCytof
+- gating step, but advises that you must adjust the values yourself
+- oddly specific spelled-out arcsinh comment:
+#+begin_src R
+sce <- normCytof(sce, k = NULL, # 'k=NULL' skips normalization, which is a separate step not covered here
+                 assays = "counts", # a-r-c-s-i-n-h
+                 transform = TRUE,
+                 cofactor = 5)
+#+end_src
+- they take you through the steps, and then put it together in a complete script at the bottom
+
+Iter 3:
+- similar visual hand holding as in iter 1, but similar hand holding them holding for gemini
+- says for gating you can use FJ (or similar) or do it programmatically, and shows you the programmatic approach.
+- manual annotation based on heatmap emphasized again
+
+Iter 4:
+- does not hold your hand as much as the others
+- references FJ and Cytobank as SaaS but not newer ones that are more commonly used (eg. CellEngine and OMIQ)
+
+Iter 5:
+- back to the visual hand holding. consider context engineering this in to stay. back to "this is crucial" which we saw in iter 2.
+- uses the scater package, meant for scrna seq apparently
+- similar format as iter 2, with a Rmd style at the top, and the a R Script at the bottom that puts it all together
+- references diffcyt as a >1 fcs file option
+
+Iter 6:
+- uses the word crucial again associated with a metadata file. perhaps its drawing from a particular vignette where this is used?
+- goes with the example data frame rather than the visual table for the marker file
+- the gating section is more example and suggestion
+- scater does the transform
+- flowsom used, phenograph suggested
+- heatmap and manual annotation emphasized again
+- diffcyt referenced again for multiple files
+
+Iter 7:
+- uses the "crucial" lingo, suggesting that this is in a catalyst tutorial
+- talking in terms of cytobank, suggesting "older" training data
+- has the "markdown and then full pipeline after" format
+- says catalyst can do batch effect correction (chatgpt says that it can't directly)
+
+Iter 8:
+- uses cytofkit, which references cytofkit::cytof_exprs_normalize as a suggestion for >1 file in the end, but does not use cytofkit in the actual pipeline
+- the "table" vis for the marker metadata
+
+Iter 9:
+- has diffcyt, but not used in the pipeline, rather used in the suggestion, as cytofkit from iter 8
+- CyNORM package hallucinated. Probably meant CytoNorm
+
+Iter 10:
+- suggests premessa package for bead norm (other iters have done this too)
+- it does flow style spillover correction, but through flowcore, not catalyst. I don't know if this step is valid.

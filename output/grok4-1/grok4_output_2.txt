@@ -1,0 +1,142 @@
+Below is a high-level CyTOF (Cytometry by Time-of-Flight) analysis pipeline for processing and analyzing a single FCS (Flow Cytometry Standard) file. CyTOF data typically involves high-dimensional mass spectrometry-based cytometry for immune cell profiling or similar applications. This pipeline assumes you have basic familiarity with programming and tools like R or Python. I'll provide it in R using popular packages (e.g., from Bioconductor), as R is commonly used in cytometry workflows. If you prefer Python (e.g., using libraries like FlowCytometryTools or Scanpy), let me know for an alternative.
+
+### Prerequisites
+- Install R (version 4.0+ recommended) and RStudio.
+- Install required packages via Bioconductor/CRAN:
+  ```R
+  if (!requireNamespace("BiocManager", quietly = TRUE))
+      install.packages("BiocManager")
+  BiocManager::install(c("flowCore", "flowViz", "flowStats", "FlowSOM", "CATALYST", "ggplot2"))
+  install.packages(c("tidyverse", "umap"))
+  ```
+- Your input: A single FCS file (e.g., `sample.fcs`) from a CyTOF experiment. This file should contain raw or pre-processed event data with metal isotope channels.
+
+### Step-by-Step Pipeline
+This pipeline covers:
+1. Data loading and preprocessing.
+2. Quality control and gating.
+3. Dimensionality reduction and clustering.
+4. Visualization and basic analysis.
+5. Exporting results.
+
+I'll include executable R code snippets for each step. Run them sequentially in an R script.
+
+#### 1. Load Data and Preprocess
+Load the FCS file, perform basic normalization (e.g., arcsinh transformation for CyTOF data), and remove beads/debris if needed.
+
+```R
+library(flowCore)
+library(flowViz)
+library(flowStats)
+library(tidyverse)
+
+# Load the FCS file
+fcs_file <- "path/to/your/sample.fcs"  # Replace with your file path
+flow_set <- read.flowSet(fcs_file)
+
+# Extract the first (and only) sample as a flowFrame
+ff <- flow_set[[1]]
+
+# Arcsinh transformation (common for CyTOF to handle high dynamic range)
+cofactor <- 5  # Adjust based on your data; 5 is standard for CyTOF
+exprs(ff) <- asinh(exprs(ff) / cofactor)
+
+# Optional: Remove beads if your data includes them (e.g., based on channels like Ce140 or Ir191)
+# Assume bead channels are named 'Ce140Di' or similar; adjust accordingly
+bead_channels <- c("Ce140Di")  # Example; check your panel
+ff <- ff[apply(exprs(ff)[, bead_channels], 1, function(x) all(x < 1)), ]  # Threshold beads out
+
+# Basic stats
+summary(ff)
+```
+
+#### 2. Quality Control and Gating
+Perform QC to remove doublets, debris, and dead cells. Use manual or automated gating.
+
+```R
+library(CATALYST)
+
+# Example: Gate live cells (assuming DNA channels like Ir191/Ir193 for singlets, and a viability marker)
+# Adjust channel names based on your panel (e.g., 'Ir191Di', 'Pt195Di' for dead cells)
+live_gate <- rectangleGate(filterId = "live", "Ir191Di" = c(1, Inf), "Ir193Di" = c(1, Inf), "Pt195Di" = c(-Inf, 0.5))
+ff_live <- Subset(ff, live_gate)
+
+# Remove doublets (e.g., based on event length or DNA intercalator)
+doublet_gate <- rectangleGate(filterId = "singlets", "Event_length" = c(10, 50))  # Adjust thresholds
+ff_singlets <- Subset(ff_live, doublet_gate)
+
+# Visualize gating
+xyplot(`Ir191Di` ~ `Ir193Di`, data = ff_singlets, smooth = FALSE)  # Example plot
+```
+
+#### 3. Clustering and Dimensionality Reduction
+Use FlowSOM for clustering (self-organizing maps, great for CyTOF) and UMAP for visualization.
+
+```R
+library(FlowSOM)
+library(umap)
+
+# Select marker channels for analysis (exclude technical ones like Time, Event_length, beads)
+marker_channels <- colnames(ff_singlets)[grep("Di$", colnames(ff_singlets))]  # Example: All metal channels ending in 'Di'
+marker_channels <- setdiff(marker_channels, c("Ir191Di", "Ir193Di", "Ce140Di"))  # Exclude DNA/beads
+
+# Build FlowSOM model
+fsom <- ReadInput(ff_singlets, transform = FALSE)  # Already transformed
+fsom <- BuildSOM(fsom, colsToUse = marker_channels, xdim = 10, ydim = 10)  # 10x10 grid
+fsom <- BuildMST(fsom)  # Minimum spanning tree
+
+# Meta-clustering (e.g., into 20 clusters; adjust k)
+meta <- metaClustering_consensus(fsom$map$codes, k = 20)
+ff_singlets$cluster <- factor(meta[fsom$map$mapping[,1]])
+
+# UMAP for dimensionality reduction
+umap_res <- umap(exprs(ff_singlets)[, marker_channels])
+ff_singlets$UMAP1 <- umap_res$layout[,1]
+ff_singlets$UMAP2 <- umap_res$layout[,2]
+```
+
+#### 4. Visualization and Analysis
+Generate plots for clusters, heatmaps, etc.
+
+```R
+library(ggplot2)
+
+# UMAP plot colored by cluster
+ggplot(as.data.frame(exprs(ff_singlets)), aes(x = UMAP1, y = UMAP2, color = cluster)) +
+  geom_point(alpha = 0.5, size = 0.5) +
+  theme_minimal() +
+  labs(title = "UMAP of CyTOF Clusters")
+
+# Heatmap of median marker expression per cluster
+cluster_medians <- aggregate(exprs(ff_singlets)[, marker_channels], list(cluster = ff_singlets$cluster), median)
+pheatmap::pheatmap(cluster_medians[, -1], scale = "column", clustering_method = "ward.D2",
+                   main = "Marker Expression Heatmap")
+
+# Basic differential analysis (e.g., cluster abundance)
+cluster_counts <- table(ff_singlets$cluster)
+barplot(cluster_counts, main = "Cluster Abundances")
+```
+
+#### 5. Export Results
+Save processed data and figures.
+
+```R
+# Export processed flowFrame as new FCS
+write.FCS(ff_singlets, "processed_sample.fcs")
+
+# Save cluster assignments as CSV
+write.csv(as.data.frame(exprs(ff_singlets)), "cluster_results.csv")
+
+# Save plots (e.g., as PDF)
+ggsave("umap_plot.pdf", width = 8, height = 6)
+```
+
+### Notes and Customizations
+- **Panel-Specific Adjustments**: CyTOF panels vary (e.g., 30-50 markers). Update `marker_channels` and gates based on your experiment's design file (often a CSV with channel names and markers).
+- **Scaling and Tuning**: The arcsinh cofactor (5) is standard but may need tweaking. For clustering, experiment with FlowSOM grid size or use alternatives like Phenograph (via `Rphenograph` package).
+- **Advanced Options**: For differential abundance (e.g., between conditions), use `diffcyt` package. If this is part of a larger study with multiple files, extend to `flowSet` for batch processing.
+- **Performance**: For large files (>100k events), subsample or use parallel computing (e.g., via `parallel` package).
+- **Troubleshooting**: If your FCS file has issues (e.g., non-standard format), check with `flowCore::isFCSfile()`. Ensure no missing values.
+- **Resources**: Refer to the CyTOF workflow vignette in Bioconductor (`vignette("CyTOFWorkflow")`) or papers like the original FlowSOM publication for deeper dives.
+
+If this doesn't match your setup (e.g., specific software, multiple files, or a different focus like statistical testing), provide more details for refinements!

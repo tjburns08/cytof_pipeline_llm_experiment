@@ -1,0 +1,520 @@
+# CyTOF Analysis Pipeline for Single File
+
+Here's a comprehensive pipeline for analyzing a single CyTOF (Cytometry by Time-Of-Flight) data file in R:
+
+```r
+# ===============================================
+# CyTOF Single File Analysis Pipeline
+# ===============================================
+
+# Install and load required packages
+# ===============================================
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+required_packages <- c(
+    "flowCore",
+    "CATALYST",
+    "SingleCellExperiment",
+    "ggplot2",
+    "flowViz",
+    "FlowSOM",
+    "Rtsne",
+    "uwot",
+    "ConsensusClusterPlus",
+    "ComplexHeatmap",
+    "viridis",
+    "dplyr",
+    "reshape2"
+)
+
+for (pkg in required_packages) {
+    if (!require(pkg, character.only = TRUE)) {
+        BiocManager::install(pkg)
+        library(pkg, character.only = TRUE)
+    }
+}
+
+# ===============================================
+# 1. DATA IMPORT
+# ===============================================
+
+# Read FCS file
+read_cytof_data <- function(file_path) {
+    ff <- read.FCS(file_path, transformation = FALSE, truncate_max_range = FALSE)
+    cat("File loaded successfully!\n")
+    cat("Number of events:", nrow(ff), "\n")
+    cat("Number of parameters:", ncol(ff), "\n")
+    return(ff)
+}
+
+# Example usage
+file_path <- "path/to/your/cytof_file.fcs"
+ff <- read_cytof_data(file_path)
+
+# ===============================================
+# 2. DATA PREPROCESSING
+# ===============================================
+
+# Inspect parameters
+inspect_parameters <- function(ff) {
+    params <- pData(parameters(ff))
+    print(params[, c("name", "desc")])
+    return(params)
+}
+
+params <- inspect_parameters(ff)
+
+# Define marker panels
+define_markers <- function(ff) {
+    # Get parameter descriptions
+    marker_names <- pData(parameters(ff))$desc
+    param_names <- pData(parameters(ff))$name
+    
+    # Identify marker channels (exclude Time, Event_length, DNA, etc.)
+    lineage_markers <- c("CD3", "CD4", "CD8", "CD19", "CD20", "CD14", "CD16", 
+                         "CD56", "CD11c", "CD123")  # Adjust based on your panel
+    
+    functional_markers <- c("Ki67", "pSTAT1", "pSTAT3", "pSTAT5", 
+                           "pCREB", "pERK")  # Adjust based on your panel
+    
+    return(list(
+        all_markers = marker_names,
+        lineage = lineage_markers,
+        functional = functional_markers
+    ))
+}
+
+markers <- define_markers(ff)
+
+# Extract expression matrix
+get_expression_matrix <- function(ff) {
+    expr <- exprs(ff)
+    colnames(expr) <- pData(parameters(ff))$desc
+    return(expr)
+}
+
+expr_data <- get_expression_matrix(ff)
+
+# ===============================================
+# 3. QUALITY CONTROL
+# ===============================================
+
+# Remove beads and doublets based on DNA content and event length
+qc_filtering <- function(ff) {
+    expr <- exprs(ff)
+    
+    # Identify Time, Event_length, and DNA channels
+    time_col <- grep("Time", colnames(expr), ignore.case = TRUE)[1]
+    event_length_col <- grep("Event_length|Length", colnames(expr), ignore.case = TRUE)[1]
+    dna_col <- grep("DNA|Ir193|Ir191", colnames(expr), ignore.case = TRUE)[1]
+    
+    # Remove events based on time (to exclude time-related artifacts)
+    time_threshold <- quantile(expr[, time_col], c(0.01, 0.99))
+    time_filter <- expr[, time_col] > time_threshold[1] & 
+                   expr[, time_col] < time_threshold[2]
+    
+    # Remove doublets based on event length
+    if (!is.na(event_length_col)) {
+        length_threshold <- quantile(expr[, event_length_col], 0.95)
+        length_filter <- expr[, event_length_col] < length_threshold
+    } else {
+        length_filter <- rep(TRUE, nrow(expr))
+    }
+    
+    # Remove debris based on DNA content
+    if (!is.na(dna_col)) {
+        dna_threshold <- quantile(expr[, dna_col], 0.05)
+        dna_filter <- expr[, dna_col] > dna_threshold
+    } else {
+        dna_filter <- rep(TRUE, nrow(expr))
+    }
+    
+    # Combine filters
+    cells_to_keep <- time_filter & length_filter & dna_filter
+    
+    cat("Events before QC:", nrow(expr), "\n")
+    cat("Events after QC:", sum(cells_to_keep), "\n")
+    cat("Removed:", nrow(expr) - sum(cells_to_keep), 
+        "(", round((1 - sum(cells_to_keep)/nrow(expr)) * 100, 2), "%)\n")
+    
+    # Create filtered flowFrame
+    ff_filtered <- ff[cells_to_keep, ]
+    return(ff_filtered)
+}
+
+ff_qc <- qc_filtering(ff)
+
+# Plot QC metrics
+plot_qc_metrics <- function(ff) {
+    expr <- exprs(ff)
+    
+    # Find relevant columns
+    time_col <- grep("Time", colnames(expr), ignore.case = TRUE)[1]
+    event_length_col <- grep("Event_length|Length", colnames(expr), ignore.case = TRUE)[1]
+    dna_col <- grep("DNA|Ir193|Ir191", colnames(expr), ignore.case = TRUE)[1]
+    
+    par(mfrow = c(2, 2))
+    
+    # Time distribution
+    if (!is.na(time_col)) {
+        plot(expr[, time_col], main = "Time Distribution", 
+             xlab = "Event", ylab = "Time", pch = ".")
+    }
+    
+    # Event length distribution
+    if (!is.na(event_length_col)) {
+        hist(expr[, event_length_col], breaks = 100, 
+             main = "Event Length Distribution", xlab = "Event Length")
+    }
+    
+    # DNA content
+    if (!is.na(dna_col)) {
+        hist(expr[, dna_col], breaks = 100, 
+             main = "DNA Content", xlab = "DNA Signal")
+    }
+    
+    par(mfrow = c(1, 1))
+}
+
+plot_qc_metrics(ff)
+
+# ===============================================
+# 4. DATA TRANSFORMATION
+# ===============================================
+
+# Arcsinh transformation (standard for CyTOF)
+transform_cytof <- function(ff, cofactor = 5) {
+    expr <- exprs(ff)
+    expr_transformed <- asinh(expr / cofactor)
+    exprs(ff) <- expr_transformed
+    
+    cat("Data transformed using arcsinh with cofactor", cofactor, "\n")
+    return(ff)
+}
+
+ff_transformed <- transform_cytof(ff_qc, cofactor = 5)
+
+# ===============================================
+# 5. DIMENSIONALITY REDUCTION
+# ===============================================
+
+# Select markers for dimensionality reduction
+select_clustering_markers <- function(expr_data, markers_to_use) {
+    marker_cols <- colnames(expr_data) %in% markers_to_use
+    return(expr_data[, marker_cols])
+}
+
+# Subsample for faster computation (optional)
+subsample_data <- function(expr_data, n = 10000) {
+    if (nrow(expr_data) > n) {
+        set.seed(42)
+        idx <- sample(1:nrow(expr_data), n)
+        return(list(data = expr_data[idx, ], indices = idx))
+    } else {
+        return(list(data = expr_data, indices = 1:nrow(expr_data)))
+    }
+}
+
+# Get transformed expression data
+expr_transformed <- exprs(ff_transformed)
+colnames(expr_transformed) <- pData(parameters(ff_transformed))$desc
+
+# Subsample for visualization
+subsampled <- subsample_data(expr_transformed, n = 10000)
+
+# Select markers for clustering
+clustering_markers <- markers$lineage  # Use lineage markers for clustering
+clustering_data <- select_clustering_markers(
+    subsampled$data, 
+    clustering_markers
+)
+
+# t-SNE
+run_tsne <- function(data, perplexity = 30) {
+    set.seed(42)
+    cat("Running t-SNE...\n")
+    tsne_result <- Rtsne(data, dims = 2, perplexity = perplexity, 
+                         check_duplicates = FALSE, pca = TRUE, 
+                         max_iter = 1000)
+    return(tsne_result$Y)
+}
+
+tsne_coords <- run_tsne(clustering_data, perplexity = 30)
+
+# UMAP
+run_umap <- function(data) {
+    set.seed(42)
+    cat("Running UMAP...\n")
+    umap_result <- umap(data, n_neighbors = 15, min_dist = 0.1)
+    return(umap_result)
+}
+
+umap_coords <- run_umap(clustering_data)
+
+# ===============================================
+# 6. CLUSTERING
+# ===============================================
+
+# FlowSOM clustering
+run_flowsom <- function(ff, clustering_markers, k = 20) {
+    cat("Running FlowSOM clustering...\n")
+    
+    # Prepare data
+    marker_indices <- which(pData(parameters(ff))$desc %in% clustering_markers)
+    
+    # Run FlowSOM
+    fsom <- FlowSOM(ff, 
+                    colsToUse = marker_indices,
+                    xdim = 10, ydim = 10,
+                    nClus = k,
+                    seed = 42)
+    
+    return(fsom)
+}
+
+fsom <- run_flowsom(ff_transformed, markers$lineage, k = 20)
+clusters <- GetMetaclusters(fsom)
+
+# ===============================================
+# 7. VISUALIZATION
+# ===============================================
+
+# Plot t-SNE with clusters
+plot_tsne_clusters <- function(tsne_coords, clusters, title = "t-SNE with Clusters") {
+    df <- data.frame(
+        tSNE1 = tsne_coords[, 1],
+        tSNE2 = tsne_coords[, 2],
+        Cluster = as.factor(clusters[subsampled$indices])
+    )
+    
+    p <- ggplot(df, aes(x = tSNE1, y = tSNE2, color = Cluster)) +
+        geom_point(size = 0.5, alpha = 0.6) +
+        theme_minimal() +
+        labs(title = title) +
+        theme(legend.position = "right") +
+        guides(color = guide_legend(override.aes = list(size = 3)))
+    
+    print(p)
+    return(p)
+}
+
+p_tsne <- plot_tsne_clusters(tsne_coords, clusters)
+
+# Plot UMAP with clusters
+plot_umap_clusters <- function(umap_coords, clusters, title = "UMAP with Clusters") {
+    df <- data.frame(
+        UMAP1 = umap_coords[, 1],
+        UMAP2 = umap_coords[, 2],
+        Cluster = as.factor(clusters[subsampled$indices])
+    )
+    
+    p <- ggplot(df, aes(x = UMAP1, y = UMAP2, color = Cluster)) +
+        geom_point(size = 0.5, alpha = 0.6) +
+        theme_minimal() +
+        labs(title = title) +
+        theme(legend.position = "right") +
+        guides(color = guide_legend(override.aes = list(size = 3)))
+    
+    print(p)
+    return(p)
+}
+
+p_umap <- plot_umap_clusters(umap_coords, clusters)
+
+# Heatmap of marker expression by cluster
+plot_cluster_heatmap <- function(expr_data, clusters, markers_to_plot) {
+    # Calculate median expression per cluster
+    cluster_medians <- aggregate(expr_data, 
+                                  by = list(Cluster = clusters), 
+                                  FUN = median)
+    
+    rownames(cluster_medians) <- cluster_medians$Cluster
+    cluster_medians <- cluster_medians[, -1]
+    
+    # Select markers
+    marker_cols <- colnames(cluster_medians) %in% markers_to_plot
+    heatmap_data <- as.matrix(cluster_medians[, marker_cols])
+    
+    # Plot heatmap
+    library(ComplexHeatmap)
+    library(circlize)
+    
+    col_fun <- colorRamp2(c(-2, 0, 2), c("blue", "white", "red"))
+    
+    ht <- Heatmap(t(scale(heatmap_data)),
+                  name = "Expression\n(scaled)",
+                  col = col_fun,
+                  cluster_rows = TRUE,
+                  cluster_columns = TRUE,
+                  show_row_names = TRUE,
+                  show_column_names = TRUE,
+                  row_names_side = "left",
+                  column_names_rot = 45,
+                  heatmap_legend_param = list(direction = "horizontal"))
+    
+    draw(ht, heatmap_legend_side = "bottom")
+    return(ht)
+}
+
+ht <- plot_cluster_heatmap(expr_transformed, clusters, markers$lineage)
+
+# Plot individual markers on t-SNE
+plot_marker_expression <- function(tsne_coords, expr_data, marker_name) {
+    marker_col <- which(colnames(expr_data) == marker_name)
+    
+    if (length(marker_col) == 0) {
+        cat("Marker not found:", marker_name, "\n")
+        return(NULL)
+    }
+    
+    df <- data.frame(
+        tSNE1 = tsne_coords[, 1],
+        tSNE2 = tsne_coords[, 2],
+        Expression = expr_data[subsampled$indices, marker_col]
+    )
+    
+    p <- ggplot(df, aes(x = tSNE1, y = tSNE2, color = Expression)) +
+        geom_point(size = 0.5, alpha = 0.8) +
+        scale_color_viridis(option = "magma") +
+        theme_minimal() +
+        labs(title = paste(marker_name, "Expression"), 
+             color = "Expression") +
+        theme(legend.position = "right")
+    
+    print(p)
+    return(p)
+}
+
+# Plot multiple markers
+for (marker in markers$lineage[1:4]) {
+    plot_marker_expression(tsne_coords, expr_transformed, marker)
+}
+
+# ===============================================
+# 8. CLUSTER CHARACTERIZATION
+# ===============================================
+
+# Calculate cluster statistics
+calculate_cluster_stats <- function(expr_data, clusters, markers_to_analyze) {
+    marker_cols <- colnames(expr_data) %in% markers_to_analyze
+    
+    # Cluster sizes
+    cluster_sizes <- table(clusters)
+    
+    # Median expression per cluster
+    cluster_medians <- aggregate(expr_data[, marker_cols], 
+                                  by = list(Cluster = clusters), 
+                                  FUN = median)
+    
+    # Calculate percentage of total
+    cluster_percentages <- prop.table(cluster_sizes) * 100
+    
+    stats <- list(
+        sizes = cluster_sizes,
+        percentages = cluster_percentages,
+        medians = cluster_medians
+    )
+    
+    return(stats)
+}
+
+cluster_stats <- calculate_cluster_stats(expr_transformed, clusters, 
+                                         c(markers$lineage, markers$functional))
+
+print("Cluster Sizes:")
+print(cluster_stats$sizes)
+print("\nCluster Percentages:")
+print(round(cluster_stats$percentages, 2))
+
+# ===============================================
+# 9. EXPORT RESULTS
+# ===============================================
+
+# Save results
+save_results <- function(output_dir = "cytof_analysis_results") {
+    dir.create(output_dir, showWarnings = FALSE)
+    
+    # Save plots
+    ggsave(file.path(output_dir, "tsne_clusters.pdf"), 
+           p_tsne, width = 8, height = 6)
+    ggsave(file.path(output_dir, "umap_clusters.pdf"), 
+           p_umap, width = 8, height = 6)
+    
+    pdf(file.path(output_dir, "cluster_heatmap.pdf"), width = 10, height = 8)
+    draw(ht, heatmap_legend_side = "bottom")
+    dev.off()
+    
+    # Save cluster assignments
+    cluster_assignments <- data.frame(
+        Event = 1:length(clusters),
+        Cluster = clusters
+    )
+    write.csv(cluster_assignments, 
+              file.path(output_dir, "cluster_assignments.csv"), 
+              row.names = FALSE)
+    
+    # Save cluster statistics
+    write.csv(cluster_stats$medians, 
+              file.path(output_dir, "cluster_medians.csv"), 
+              row.names = FALSE)
+    
+    # Save dimensionality reduction coordinates
+    dr_coords <- data.frame(
+        Event = subsampled$indices,
+        tSNE1 = tsne_coords[, 1],
+        tSNE2 = tsne_coords[, 2],
+        UMAP1 = umap_coords[, 1],
+        UMAP2 = umap_coords[, 2],
+        Cluster = clusters[subsampled$indices]
+    )
+    write.csv(dr_coords, 
+              file.path(output_dir, "dimensionality_reduction_coords.csv"), 
+              row.names = FALSE)
+    
+    cat("Results saved to:", output_dir, "\n")
+}
+
+save_results()
+
+# ===============================================
+# 10. SUMMARY REPORT
+# ===============================================
+
+generate_summary <- function() {
+    cat("\n=== CyTOF Analysis Summary ===\n\n")
+    cat("Total events:", nrow(ff), "\n")
+    cat("Events after QC:", nrow(ff_qc), "\n")
+    cat("Number of parameters:", ncol(ff), "\n")
+    cat("Number of clusters:", length(unique(clusters)), "\n")
+    cat("\nCluster Distribution:\n")
+    print(cluster_stats$percentages)
+    cat("\n============================\n")
+}
+
+generate_summary()
+
+```
+
+## Usage Instructions
+
+1. **Install packages**: The script will automatically install required packages
+2. **Set file path**: Change `file_path` to your FCS file location
+3. **Adjust markers**: Modify `lineage_markers` and `functional_markers` based on your panel
+4. **Adjust parameters**:
+   - `cofactor`: Transformation parameter (typically 5 for CyTOF)
+   - `k`: Number of clusters in FlowSOM
+   - `perplexity`: t-SNE parameter
+   - Subsampling size for visualization
+
+5. **Run the pipeline**: Execute the script section by section or all at once
+
+## Key Outputs
+
+- t-SNE and UMAP plots with cluster overlays
+- Heatmap of marker expression by cluster
+- Individual marker expression plots
+- Cluster statistics and assignments
+- All results exported to `cytof_analysis_results/` directory
+
+This pipeline provides a complete workflow from raw FCS file to publication-ready visualizations!

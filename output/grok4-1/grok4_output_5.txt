@@ -1,0 +1,134 @@
+Below is a complete, self-contained CyTOF (Cytometry by Time-Of-Flight) analysis pipeline for processing a single FCS file. This pipeline is implemented in R, as it's a popular language for cytometry data analysis with robust packages. It covers basic steps including data loading, preprocessing (cleaning and transformation), clustering, dimensionality reduction, and visualization. This is a high-level example suitable for exploratory analysis—adapt it as needed for your specific research goals.
+
+### Prerequisites
+- **R Installation**: Ensure you have R (version 4.0+) installed. Download from [CRAN](https://cran.r-project.org/).
+- **Required Packages**: Install these via CRAN or Bioconductor:
+  ```
+  install.packages(c("BiocManager", "flowCore", "CATALYST", "ggplot2", "Rtsne", "umap"))
+  BiocManager::install(c("flowCore", "CATALYST"))
+  ```
+- **Input File**: A single FCS file (e.g., `your_cytof_file.fcs`) from a CyTOF experiment. Place it in your working directory.
+- **Hardware**: This assumes a standard laptop; for large files (>1M events), you may need more RAM.
+
+### Pipeline Overview
+1. **Load and Preprocess**: Read the FCS file, apply arcsinh transformation (common for CyTOF data to handle high dynamic range), and filter out debris/low-quality events.
+2. **Clustering**: Use FlowSOM for unsupervised clustering to identify cell populations.
+3. **Dimensionality Reduction**: Apply t-SNE or UMAP for visualization.
+4. **Visualization**: Generate plots (e.g., heatmaps, t-SNE maps) to explore clusters and marker expressions.
+5. **Output**: Save results as CSV, plots, and an annotated FCS file.
+
+This pipeline uses the `CATALYST` package, which is designed for CyTOF analysis and builds on `flowCore`.
+
+### R Script for the Pipeline
+Copy-paste this into an R script (e.g., `cytof_pipeline.R`) and run it in RStudio or via `Rscript cytof_pipeline.R`.
+
+```r
+# Load libraries
+library(flowCore)
+library(CATALYST)
+library(ggplot2)
+library(Rtsne)
+library(umap)
+
+# Step 1: Load the FCS file
+fcs_file <- "your_cytof_file.fcs"  # Replace with your file path
+fcs_data <- read.FCS(fcs_file, transformation = FALSE)  # Read raw data
+
+# Print basic info
+print(parameters(fcs_data))  # Shows markers/channels
+print(dim(exprs(fcs_data)))  # Number of events and channels
+
+# Step 2: Preprocess data
+# Select relevant markers (exclude technical channels like Time, Event_length; adjust based on your panel)
+all_markers <- colnames(fcs_data)
+technical_channels <- c("Time", "Event_length", "Center", "Offset", "Residual", "Width")  # Common technical ones
+markers_of_interest <- setdiff(all_markers, technical_channels)  # Assume these are your protein markers
+
+# Apply arcsinh transformation (cofactor 5 is standard for CyTOF)
+transformed_data <- asinh(exprs(fcs_data)[, markers_of_interest] / 5)
+
+# Filter out low-quality events (e.g., based on DNA/iridium channels if present; adjust thresholds)
+# Assuming DNA channels like Ir191, Ir193 are present for cell identification
+if ("Ir191Di" %in% colnames(fcs_data) && "Ir193Di" %in% colnames(fcs_data)) {
+  dna_intensity <- rowMeans(exprs(fcs_data)[, c("Ir191Di", "Ir193Di")])
+  quality_filter <- dna_intensity > 1  # Threshold for valid cells (adjust as needed)
+  transformed_data <- transformed_data[quality_filter, ]
+  cat("Filtered to", nrow(transformed_data), "high-quality events\n")
+}
+
+# Convert to flowFrame for further analysis
+ff_transformed <- flowFrame(transformed_data)
+
+# Step 3: Clustering with FlowSOM (via CATALYST)
+# Create a SingleCellExperiment object
+sce <- SingleCellExperiment(assays = list(exprs = t(transformed_data)))  # Transpose for CATALYST
+colData(sce)$sample_id <- rep(1, nrow(transformed_data))  # Single sample
+rowData(sce)$marker_class <- rep("type", ncol(transformed_data))  # All markers as 'type' for clustering
+colnames(sce) <- markers_of_interest
+
+# Run FlowSOM clustering (10x10 grid, 10 metaclusters; adjust parameters)
+sce <- cluster(sce, features = markers_of_interest, xdim = 10, ydim = 10, maxK = 10)
+
+# Access clusters
+clusters <- cluster_codes(sce)$SOM  # SOM clusters
+metaclusters <- cluster_codes(sce)$meta10  # Metaclusters (merged)
+
+# Step 4: Dimensionality Reduction
+# t-SNE (perplexity 30, common for cytometry)
+tsne_res <- Rtsne(transformed_data, dims = 2, perplexity = 30, verbose = TRUE)
+
+# UMAP (alternative; n_neighbors=15)
+umap_res <- umap(transformed_data, n_components = 2)
+
+# Step 5: Visualization
+# Heatmap of median marker expression per cluster
+cluster_medians <- aggregate(transformed_data, by = list(cluster = metaclusters), FUN = median)
+heatmap(as.matrix(cluster_medians[, -1]), Colv = NA, scale = "column", main = "Cluster Marker Expression")
+
+# t-SNE plot colored by metacluster
+tsne_df <- data.frame(tsne_res$Y, cluster = factor(metaclusters))
+ggplot(tsne_df, aes(x = X1, y = X2, color = cluster)) + 
+  geom_point(size = 0.5, alpha = 0.5) + 
+  theme_minimal() + 
+  ggtitle("t-SNE of CyTOF Data Colored by Metacluster")
+
+# UMAP plot (similarly)
+umap_df <- data.frame(umap_res$layout, cluster = factor(metaclusters))
+ggplot(umap_df, aes(x = X1, y = X2, color = cluster)) + 
+  geom_point(size = 0.5, alpha = 0.5) + 
+  theme_minimal() + 
+  ggtitle("UMAP of CyTOF Data Colored by Metacluster")
+
+# Step 6: Save Outputs
+# Save cluster assignments as CSV
+output_df <- data.frame(transformed_data, cluster = metaclusters)
+write.csv(output_df, "cytof_clusters.csv", row.names = FALSE)
+
+# Save annotated FCS file
+exprs(ff_transformed) <- cbind(exprs(ff_transformed), cluster = metaclusters)
+write.FCS(ff_transformed, "annotated_cytof_file.fcs")
+
+# Save plots (requires ggsave for ggplot)
+ggsave("tsne_plot.png", width = 8, height = 6)
+ggsave("umap_plot.png", width = 8, height = 6)
+
+cat("Pipeline complete! Check outputs in your working directory.\n")
+```
+
+### How to Run
+1. Replace `"your_cytof_file.fcs"` with your actual file path.
+2. Run the script in R: `source("cytof_pipeline.R")` or via RStudio.
+3. Adjust parameters:
+   - Markers: Customize `markers_of_interest` based on your panel (e.g., CD45, CD3, etc.).
+   - Filtering: Tune thresholds for quality control (e.g., based on bead removal or Gaussian parameters if available).
+   - Clustering: Change `xdim`, `ydim`, or `maxK` for more/less granularity.
+   - For very large files, subsample with `transformed_data <- transformed_data[sample(1:nrow(transformed_data), 100000), ]`.
+
+### Notes and Limitations
+- **Customization**: This is a basic pipeline. For advanced analysis (e.g., differential abundance, statistical testing), explore more of `CATALYST` or packages like `diffcyt`.
+- **Data Size**: CyTOF files can be large; if you encounter memory issues, subsample events.
+- **Validation**: Always visually inspect results (e.g., check for batch effects if you expand to multiple files).
+- **Alternatives**: If you prefer Python, check out `cytofpy` or `FlowCal`. For GUI-based analysis, use Cytobank or FlowJo.
+- **Resources**: Refer to the [CATALYST vignette](https://bioconductor.org/packages/release/bioc/vignettes/CATALYST/inst/doc/CATALYST.html) for more details.
+
+If you provide more details about your file (e.g., markers, specific goals like differential analysis), I can refine this pipeline!

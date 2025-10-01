@@ -1,0 +1,272 @@
+Below is a self-contained R pipeline for analyzing a single CyTOF (.fcs) file. It performs QC (anomaly removal), cleanup gating (beads, debris/DNA-, dead, doublets), arcsinh transform, dimensionality reduction (UMAP), clustering (FlowSOM + meta-clustering), and exports figures and tables. It makes minimal assumptions and auto-detects common channel names; edit the marker selection and channel patterns to fit your panel.
+
+Save as run_cytof_single.R and run: Rscript run_cytof_single.R /path/to/file.fcs output_dir
+
+R script:
+
+#!/usr/bin/env Rscript
+
+suppressPackageStartupMessages({
+  library(flowCore)
+  library(peacoQC)
+  library(FlowSOM)
+  library(ggplot2)
+  library(uwot)
+  library(data.table)
+  library(matrixStats)
+})
+
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) < 2) {
+  stop("Usage: Rscript run_cytof_single.R input.fcs output_dir")
+}
+fcs_file <- args[1]
+outdir   <- args[2]
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+
+set.seed(13)
+cofactor <- 5
+
+# ---------------------------
+# Helpers
+# ---------------------------
+write_png <- function(plot_obj, file, width=7, height=5, dpi=300) {
+  ggplot2::ggsave(filename=file, plot=plot_obj, width=width, height=height, dpi=dpi)
+}
+
+safe_grep <- function(patterns, x, ignore.case=TRUE) {
+  idx <- unique(unlist(lapply(patterns, function(p) grep(p, x, ignore.case=ignore.case))))
+  idx[!is.na(idx)]
+}
+
+density_gate_between_two_modes <- function(x, adjust=1.5) {
+  x <- x[is.finite(x)]
+  if (length(x) < 100) return(list(threshold=quantile(x, 0.5, na.rm=TRUE), ok=FALSE))
+  d <- density(x, adjust=adjust, na.rm=TRUE)
+  y <- d$y
+  # Peak indices
+  i_peaks <- which(diff(sign(diff(y))) == -2) + 1
+  if (length(i_peaks) < 2) {
+    return(list(threshold=quantile(x, 0.95, na.rm=TRUE), ok=FALSE))
+  }
+  # Pick first two prominent peaks
+  i_peaks <- i_peaks[order(y[i_peaks], decreasing=TRUE)]
+  i_peaks <- sort(i_peaks[1:2])
+  i_min <- which.min(y[i_peaks[1]:i_peaks[2]]) + i_peaks[1] - 1
+  thr <- d$x[i_min]
+  list(threshold=thr, ok=TRUE)
+}
+
+asinh_transform <- function(m, cofactor=5) {
+  asinh(m / cofactor)
+}
+
+# ---------------------------
+# Load data
+# ---------------------------
+message("Reading FCS: ", fcs_file)
+ff_raw <- suppressWarnings(read.FCS(fcs_file, transformation = FALSE, truncate_max_range = FALSE))
+expr_raw <- exprs(ff_raw)
+param <- parameters(ff_raw)
+pn <- pData(param)
+channel_names <- as.character(pn$`$PnN`)
+marker_names  <- as.character(pn$`$PnS`)
+marker_names[is.na(marker_names) | marker_names==""] <- channel_names
+colnames(expr_raw) <- marker_names
+
+# Identify common channels
+time_idx  <- safe_grep(c("^Time$", "time"), marker_names)
+len_idx   <- safe_grep(c("Event_length", "event.?length", "length"), marker_names)
+bead_idx  <- safe_grep(c("Bead", "Ce140", "140Ce"), marker_names)
+dna_idx1  <- safe_grep(c("Ir191", "191Ir", "DNA1"), marker_names)
+dna_idx2  <- safe_grep(c("Ir193", "193Ir", "DNA2"), marker_names)
+dead_idx  <- safe_grep(c("Pt195", "195Pt", "Dead"), marker_names)
+
+time_col  <- if (length(time_idx)>0) marker_names[time_idx[1]] else NA
+len_col   <- if (length(len_idx)>0) marker_names[len_idx[1]] else NA
+bead_col  <- if (length(bead_idx)>0) marker_names[bead_idx[1]] else NA
+dna1_col  <- if (length(dna_idx1)>0) marker_names[dna_idx1[1]] else NA
+dna2_col  <- if (length(dna_idx2)>0) marker_names[dna_idx2[1]] else NA
+dead_col  <- if (length(dead_idx)>0) marker_names[dead_idx[1]] else NA
+
+message("Detected channels:")
+message("  Time: ", ifelse(is.na(time_col), "not found", time_col))
+message("  Event_length: ", ifelse(is.na(len_col), "not found", len_col))
+message("  Beads: ", ifelse(is.na(bead_col), "not found", bead_col))
+message("  DNA1: ", ifelse(is.na(dna1_col), "not found", dna1_col))
+message("  DNA2: ", ifelse(is.na(dna2_col), "not found", dna2_col))
+message("  Viability: ", ifelse(is.na(dead_col), "not found", dead_col))
+
+# ---------------------------
+# QC: remove acquisition anomalies with peacoQC
+# ---------------------------
+ff_for_qc <- ff_raw
+if (!is.na(time_col)) {
+  message("Running peacoQC (anomaly removal over time)...")
+  qc <- suppressWarnings(cleaning_peacoQC(ff_for_qc, time_channel = time_col, remove_zeros = TRUE,
+                                          slides_min = 1, MAD=6, min_cells=150, output_directory = NULL))
+  ff_qc <- qc$FinalFF
+} else {
+  message("Time channel not found; skipping anomaly cleaning.")
+  ff_qc <- ff_for_qc
+}
+expr_qc <- exprs(ff_qc)
+colnames(expr_qc) <- marker_names  # preserve names
+
+# ---------------------------
+# Cleanup gating
+# ---------------------------
+dt <- as.data.table(expr_qc)
+
+# Remove beads (if present): keep events with bead signal below valley
+if (!is.na(bead_col)) {
+  gate <- density_gate_between_two_modes(dt[[bead_col]])
+  thr_bead <- gate$threshold
+  keep_bead <- dt[[bead_col]] < thr_bead
+  message("Bead removal: threshold=", signif(thr_bead, 4), " kept=", sum(keep_bead), "/", nrow(dt))
+  dt <- dt[keep_bead]
+}
+
+# DNA sum for debris/doublet logic
+dna_sum <- NULL
+if (!is.na(dna1_col) && !is.na(dna2_col)) {
+  dna_sum <- dt[[dna1_col]] + dt[[dna2_col]]
+  # Debris removal: keep above valley between debris and singlets
+  gate_debris <- density_gate_between_two_modes(dna_sum)
+  thr_debris <- gate_debris$threshold
+  keep_dna_low <- dna_sum > thr_debris
+  # Doublet removal: if event_length present, gate upper tail; else cap upper DNA sum
+  if (!is.na(len_col)) {
+    el <- dt[[len_col]]
+    thr_len_hi <- quantile(el, 0.995, na.rm=TRUE)
+    keep_dna_high <- el < thr_len_hi
+  } else {
+    thr_dna_hi <- quantile(dna_sum, 0.995, na.rm=TRUE)
+    keep_dna_high <- dna_sum < thr_dna_hi
+  }
+  keep_dna <- keep_dna_low & keep_dna_high
+  message("DNA/debris/doublet gating: kept=", sum(keep_dna), "/", nrow(dt))
+  dt <- dt[keep_dna]
+}
+
+# Viability gating (195Pt high = dead): keep below valley
+if (!is.na(dead_col)) {
+  gate_dead <- density_gate_between_two_modes(dt[[dead_col]])
+  thr_dead <- gate_dead$threshold
+  keep_live <- dt[[dead_col]] < thr_dead
+  message("Viability gating: threshold=", signif(thr_dead, 4), " kept=", sum(keep_live), "/", nrow(dt))
+  dt <- dt[keep_live]
+}
+
+# Optional de-noising of event length extremes if present
+if (!is.na(len_col) && len_col %in% names(dt)) {
+  el <- dt[[len_col]]
+  lo <- quantile(el, 0.005, na.rm=TRUE)
+  hi <- quantile(el, 0.995, na.rm=TRUE)
+  keep_len <- el >= lo & el <= hi
+  message("Event_length trimming: kept=", sum(keep_len), "/", nrow(dt))
+  dt <- dt[keep_len]
+}
+
+# ---------------------------
+# Transform and select markers
+# ---------------------------
+# Exclude non-protein channels from clustering
+exclude_patterns <- c("^Time$", "time", "Event_length", "length", "Bead", "Ce140", "140Ce",
+                      "Ir191", "191Ir", "Ir193", "193Ir", "Pt195", "195Pt", "Dead",
+                      "Center", "Offset", "Width", "Residual")
+all_markers <- names(dt)
+exclude_idx <- safe_grep(exclude_patterns, all_markers)
+marker_use <- setdiff(all_markers, all_markers[exclude_idx])
+
+if (length(marker_use) < 5) {
+  warning("Fewer than 5 clustering markers detected. Please adjust exclude_patterns or provide a panel.")
+}
+message("Using ", length(marker_use), " markers for DR/clustering.")
+
+# arcsinh transform numeric columns
+dt_mat <- as.matrix(dt[, ..all_markers])
+dt_tf <- dt
+dt_tf[, (all_markers) := as.data.table(asinh_transform(dt_mat, cofactor = cofactor))]
+
+# ---------------------------
+# UMAP
+# ---------------------------
+message("Computing UMAP...")
+umap_mat <- tryCatch(
+  uwot::umap(as.matrix(dt_tf[, ..marker_use]), n_neighbors = 15, min_dist = 0.3,
+             metric = "cosine", n_components = 2, verbose = TRUE, ret_model = FALSE,
+             init = "spectral", n_sgd_threads = 1),
+  error = function(e) {
+    message("UMAP failed: ", e$message, " — retrying with Euclidean metric.")
+    uwot::umap(as.matrix(dt_tf[, ..marker_use]), n_neighbors = 15, min_dist = 0.3,
+               metric = "euclidean", n_components = 2, verbose = TRUE, ret_model = FALSE,
+               init = "spectral", n_sgd_threads = 1)
+  }
+)
+dt_tf$UMAP1 <- umap_mat[,1]
+dt_tf$UMAP2 <- umap_mat[,2]
+
+p_umap <- ggplot(dt_tf[sample(.N, min(.N, 50000))], aes(UMAP1, UMAP2)) +
+  geom_point(size=0.2, alpha=0.5) + theme_bw() + ggtitle("UMAP (random 50k)")
+write_png(p_umap, file.path(outdir, "umap_raw.png"), width=6, height=5)
+
+# ---------------------------
+# Clustering: FlowSOM + meta-clustering
+# ---------------------------
+message("Running FlowSOM...")
+ff_markers <- flowFrame(as.matrix(dt_tf[, ..marker_use]))
+colnames(ff_markers) <- marker_use
+
+fsom_in <- FlowSOM::ReadInput(ff_markers, transform = FALSE, scale = FALSE)
+fsom <- FlowSOM::BuildSOM(fsom_in, colsToUse = marker_use, xdim = 10, ydim = 10)
+fsom <- FlowSOM::BuildMST(fsom)
+k_meta <- 20
+meta <- FlowSOM::metaClustering_consensus(fsom$map$codes, k = k_meta, seed = 13)
+clusters <- meta[fsom$map$mapping[,1]]
+dt_tf$cluster <- factor(clusters)
+
+# ---------------------------
+# Summaries and plots
+# ---------------------------
+# Cluster abundances
+abund <- dt_tf[, .N, by=cluster][order(as.integer(as.character(cluster)))]
+fwrite(abund, file.path(outdir, "cluster_abundances.csv"))
+
+# Marker medians per cluster
+meds <- dt_tf[, lapply(.SD, median, na.rm=TRUE), by=cluster, .SDcols=marker_use]
+fwrite(meds, file.path(outdir, "cluster_marker_medians.csv"))
+
+# UMAP colored by cluster
+p_clu <- ggplot(dt_tf[sample(.N, min(.N, 50000))], aes(UMAP1, UMAP2, color=cluster)) +
+  geom_point(size=0.2, alpha=0.6) + theme_bw() + ggtitle("UMAP by FlowSOM meta-clusters") +
+  guides(color = guide_legend(override.aes = list(size=3, alpha=1)))
+write_png(p_clu, file.path(outdir, "umap_clusters.png"), width=6.5, height=5.5)
+
+# Heatmap-like dot plot of median marker expression per cluster
+meds_long <- melt(meds, id.vars="cluster", variable.name="marker", value.name="median")
+# Z-score per marker for visualization
+meds_long[, z := (median - mean(median, na.rm=TRUE)) / sd(median, na.rm=TRUE), by=marker]
+p_heat <- ggplot(meds_long, aes(marker, cluster, fill=z)) +
+  geom_tile() + scale_fill_viridis_c(option="B", name="Z-score") +
+  theme_bw() + theme(axis.text.x=element_text(angle=90, vjust=0.5)) +
+  ggtitle("Cluster marker expression (z-score of medians)")
+write_png(p_heat, file.path(outdir, "cluster_marker_heatmap.png"), width=8, height=6)
+
+# Save event-level cluster assignments
+assignments <- dt_tf[, c("UMAP1","UMAP2","cluster"), with=FALSE]
+fwrite(assignments, file.path(outdir, "per_event_cluster_assignments.csv"))
+
+# Save cleaned, transformed data to FCS and CSV
+# Reconstruct a flowFrame for export (transformed)
+ff_out <- flowFrame(as.matrix(dt_tf[, ..all_markers]))
+colnames(ff_out) <- all_markers
+write.FCS(ff_out, filename = file.path(outdir, "cleaned_transformed.fcs"))
+fwrite(dt_tf, file.path(outdir, "cleaned_transformed.csv"))
+
+message("Done. Outputs written to: ", outdir)
+
+Notes:
+- Adjust exclude_patterns and marker_use to match your panel (e.g., add/remove signaling markers).
+- If bead normalization or debarcoding are required, perform them before this script (e.g., CATALYST::normCytof for beads, CATALYST for debarcoding).
+- The density-based gates are automatic but may need review. For publication-grade results, validate gates visually and adjust thresholds or gate interactively.

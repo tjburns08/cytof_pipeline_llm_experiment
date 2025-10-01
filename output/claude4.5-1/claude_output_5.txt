@@ -1,0 +1,385 @@
+# CyTOF Analysis Pipeline for Single File
+
+Here's a comprehensive pipeline for analyzing a single CyTOF (Mass Cytometry) data file in R:
+
+```r
+# =============================================================================
+# CyTOF Single File Analysis Pipeline
+# =============================================================================
+
+# Load required libraries
+library(flowCore)        # Reading FCS files
+library(CATALYST)        # CyTOF-specific analysis
+library(SingleCellExperiment)
+library(ggplot2)
+library(ComplexHeatmap)
+library(FlowSOM)
+library(Rtsne)
+library(uwot)           # For UMAP
+library(viridis)
+library(dplyr)
+library(tidyr)
+library(cowplot)
+
+# =============================================================================
+# 1. DATA IMPORT AND PREPROCESSING
+# =============================================================================
+
+# Read FCS file
+fcs_file <- "path/to/your/sample.fcs"
+ff <- read.FCS(fcs_file, transformation = FALSE, truncate_max_range = FALSE)
+
+# View parameters
+head(exprs(ff))
+pData(parameters(ff))
+
+# =============================================================================
+# 2. DEFINE PANEL INFORMATION
+# =============================================================================
+
+# Extract marker names
+marker_names <- pData(parameters(ff))$desc
+if(is.null(marker_names)) {
+  marker_names <- pData(parameters(ff))$name
+}
+
+# Define panel manually (adjust to your panel)
+panel <- data.frame(
+  fcs_colname = colnames(ff),
+  antigen = marker_names,
+  marker_class = "state"  # "type" for lineage, "state" for functional, "none" for non-markers
+)
+
+# Example: Specify lineage vs state markers
+lineage_markers <- c("CD3", "CD4", "CD8", "CD19", "CD14", "CD56", "CD45")
+panel$marker_class[panel$antigen %in% lineage_markers] <- "type"
+panel$marker_class[grepl("Event|Time|DNA|Viability|Bead", panel$antigen, ignore.case = TRUE)] <- "none"
+
+print(panel)
+
+# =============================================================================
+# 3. DATA TRANSFORMATION
+# =============================================================================
+
+# Arcsinh transformation (standard for CyTOF)
+# Cofactor typically 5 for CyTOF data
+cofactor <- 5
+
+# Apply transformation
+ff_trans <- ff
+exprs(ff_trans) <- asinh(exprs(ff) / cofactor)
+
+# =============================================================================
+# 4. QUALITY CONTROL
+# =============================================================================
+
+# 4.1 Event length and DNA content filtering
+plot_qc <- function(ff, channel1, channel2) {
+  df <- data.frame(
+    x = exprs(ff)[, channel1],
+    y = exprs(ff)[, channel2]
+  )
+  ggplot(df, aes(x = x, y = y)) +
+    geom_hex(bins = 100) +
+    scale_fill_viridis() +
+    labs(x = channel1, y = channel2) +
+    theme_minimal()
+}
+
+# Plot Event Length vs DNA (adjust column names)
+# plot_qc(ff, "Event_length", "Ir191Di")
+
+# 4.2 Remove doublets and debris
+# Based on DNA content (adjust thresholds)
+dna_channel <- grep("Ir191|Ir193", colnames(ff), value = TRUE)[1]
+event_length_channel <- grep("Event_length|Length", colnames(ff), value = TRUE)[1]
+
+if(length(dna_channel) > 0 & length(event_length_channel) > 0) {
+  # Simple filtering (adjust thresholds based on your data)
+  valid_cells <- exprs(ff)[, dna_channel] > 0 & 
+                 exprs(ff)[, dna_channel] < 8 &
+                 exprs(ff)[, event_length_channel] > 10 &
+                 exprs(ff)[, event_length_channel] < 75
+  
+  ff_clean <- ff[valid_cells, ]
+  ff_trans_clean <- ff_trans[valid_cells, ]
+  
+  cat("Removed", sum(!valid_cells), "events\n")
+  cat("Retained", sum(valid_cells), "events\n")
+} else {
+  ff_clean <- ff
+  ff_trans_clean <- ff_trans
+}
+
+# 4.3 Dead cell removal (if viability marker present)
+viability_channel <- grep("Cisplatin|Live", colnames(ff), value = TRUE, ignore.case = TRUE)[1]
+if(length(viability_channel) > 0) {
+  live_cells <- exprs(ff_clean)[, viability_channel] < 1  # Adjust threshold
+  ff_clean <- ff_clean[live_cells, ]
+  ff_trans_clean <- ff_trans_clean[live_cells, ]
+  cat("Live cells:", sum(live_cells), "\n")
+}
+
+# =============================================================================
+# 5. SUBSET TO MARKERS OF INTEREST
+# =============================================================================
+
+# Select only markers (exclude beads, time, etc.)
+marker_cols <- panel$fcs_colname[panel$marker_class %in% c("type", "state")]
+ff_markers <- ff_trans_clean[, marker_cols]
+
+# Create expression matrix
+expr_matrix <- exprs(ff_markers)
+colnames(expr_matrix) <- panel$antigen[match(colnames(expr_matrix), panel$fcs_colname)]
+
+# =============================================================================
+# 6. DIMENSIONALITY REDUCTION
+# =============================================================================
+
+# Downsample for visualization (if dataset is large)
+set.seed(123)
+n_cells <- nrow(expr_matrix)
+max_cells_viz <- 10000
+
+if(n_cells > max_cells_viz) {
+  sample_idx <- sample(1:n_cells, max_cells_viz)
+  expr_sample <- expr_matrix[sample_idx, ]
+} else {
+  sample_idx <- 1:n_cells
+  expr_sample <- expr_matrix
+}
+
+# 6.1 t-SNE
+set.seed(123)
+tsne_result <- Rtsne(
+  expr_sample,
+  dims = 2,
+  perplexity = 30,
+  verbose = TRUE,
+  max_iter = 1000,
+  check_duplicates = FALSE
+)
+
+tsne_coords <- data.frame(
+  tSNE1 = tsne_result$Y[, 1],
+  tSNE2 = tsne_result$Y[, 2]
+)
+
+# 6.2 UMAP
+set.seed(123)
+umap_result <- umap(
+  expr_sample,
+  n_neighbors = 15,
+  min_dist = 0.2,
+  metric = "euclidean"
+)
+
+umap_coords <- data.frame(
+  UMAP1 = umap_result[, 1],
+  UMAP2 = umap_result[, 2]
+)
+
+# =============================================================================
+# 7. CLUSTERING
+# =============================================================================
+
+# 7.1 FlowSOM clustering
+set.seed(123)
+fsom <- FlowSOM(
+  input = expr_matrix,
+  colsToUse = which(panel$marker_class == "type"),  # Use lineage markers
+  xdim = 10,
+  ydim = 10,
+  nClus = 20,  # Number of metaclusters
+  seed = 123
+)
+
+# Extract cluster assignments
+clusters <- fsom$metaclustering[fsom$FlowSOM$map$mapping[, 1]]
+
+# Add clusters to dimensionality reduction data
+tsne_coords$cluster <- factor(clusters[sample_idx])
+umap_coords$cluster <- factor(clusters[sample_idx])
+
+# =============================================================================
+# 8. VISUALIZATION
+# =============================================================================
+
+# 8.1 t-SNE plots
+p1 <- ggplot(tsne_coords, aes(x = tSNE1, y = tSNE2, color = cluster)) +
+  geom_point(size = 0.5, alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "t-SNE colored by FlowSOM clusters") +
+  theme(legend.position = "right")
+
+# 8.2 UMAP plots
+p2 <- ggplot(umap_coords, aes(x = UMAP1, y = UMAP2, color = cluster)) +
+  geom_point(size = 0.5, alpha = 0.6) +
+  theme_minimal() +
+  labs(title = "UMAP colored by FlowSOM clusters") +
+  theme(legend.position = "right")
+
+print(plot_grid(p1, p2, ncol = 2))
+
+# 8.3 Expression heatmap by cluster
+cluster_medians <- aggregate(expr_matrix, 
+                             by = list(cluster = clusters), 
+                             FUN = median)
+rownames(cluster_medians) <- cluster_medians$cluster
+cluster_medians$cluster <- NULL
+
+# Scale for visualization
+cluster_medians_scaled <- t(scale(t(cluster_medians)))
+
+# Plot heatmap
+Heatmap(
+  cluster_medians_scaled,
+  name = "Expression\n(scaled)",
+  cluster_rows = TRUE,
+  cluster_columns = TRUE,
+  show_row_names = TRUE,
+  show_column_names = TRUE,
+  column_names_gp = gpar(fontsize = 8),
+  row_names_gp = gpar(fontsize = 8),
+  col = colorRampPalette(c("blue", "white", "red"))(100)
+)
+
+# 8.4 Marker expression on dimensionality reduction
+# Function to plot marker expression
+plot_marker_expression <- function(coords, expr_data, marker, title_prefix = "t-SNE") {
+  df <- coords
+  df$expression <- expr_data[sample_idx, marker]
+  
+  ggplot(df, aes(x = df[,1], y = df[,2], color = expression)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    scale_color_viridis() +
+    labs(title = paste(title_prefix, "-", marker),
+         x = colnames(df)[1],
+         y = colnames(df)[2]) +
+    theme_minimal()
+}
+
+# Plot selected markers
+markers_to_plot <- colnames(expr_matrix)[1:min(6, ncol(expr_matrix))]
+marker_plots <- lapply(markers_to_plot, function(m) {
+  plot_marker_expression(tsne_coords[, 1:2], expr_sample, m, "t-SNE")
+})
+
+do.call(plot_grid, c(marker_plots, ncol = 3))
+
+# =============================================================================
+# 9. CLUSTER CHARACTERIZATION
+# =============================================================================
+
+# Calculate cluster frequencies
+cluster_freq <- table(clusters)
+cluster_freq_df <- data.frame(
+  Cluster = names(cluster_freq),
+  Count = as.numeric(cluster_freq),
+  Percentage = round(as.numeric(cluster_freq) / sum(cluster_freq) * 100, 2)
+)
+
+print(cluster_freq_df)
+
+# Plot cluster sizes
+ggplot(cluster_freq_df, aes(x = reorder(Cluster, -Percentage), y = Percentage)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Cluster Distribution", x = "Cluster", y = "Percentage of Cells") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# =============================================================================
+# 10. EXPORT RESULTS
+# =============================================================================
+
+# Create output directory
+output_dir <- "CyTOF_analysis_output"
+dir.create(output_dir, showWarnings = FALSE)
+
+# Save processed data
+results <- list(
+  expr_matrix = expr_matrix,
+  clusters = clusters,
+  tsne_coords = tsne_result$Y,
+  umap_coords = umap_result,
+  cluster_medians = cluster_medians,
+  panel = panel
+)
+
+saveRDS(results, file.path(output_dir, "analysis_results.rds"))
+
+# Export cluster assignments
+write.csv(
+  data.frame(cell_id = 1:length(clusters), cluster = clusters),
+  file.path(output_dir, "cluster_assignments.csv"),
+  row.names = FALSE
+)
+
+# Export cluster medians
+write.csv(
+  cluster_medians,
+  file.path(output_dir, "cluster_median_expression.csv")
+)
+
+# Save plots
+ggsave(file.path(output_dir, "tsne_clusters.pdf"), p1, width = 8, height = 6)
+ggsave(file.path(output_dir, "umap_clusters.pdf"), p2, width = 8, height = 6)
+
+pdf(file.path(output_dir, "cluster_heatmap.pdf"), width = 10, height = 8)
+Heatmap(cluster_medians_scaled,
+        name = "Expression",
+        cluster_rows = TRUE,
+        cluster_columns = TRUE)
+dev.off()
+
+cat("\nAnalysis complete! Results saved to:", output_dir, "\n")
+
+# =============================================================================
+# 11. SESSION INFO
+# =============================================================================
+
+sessionInfo()
+```
+
+## Additional Analysis Options
+
+```r
+# =============================================================================
+# OPTIONAL: DIFFERENTIAL ABUNDANCE ANALYSIS (if comparing conditions)
+# =============================================================================
+
+# If you have condition information
+# conditions <- rep("Treatment", nrow(expr_matrix))  # Example
+# 
+# abundance_results <- diffcyt::testDA_edgeR(
+#   counts = table(clusters, conditions),
+#   design = model.matrix(~conditions),
+#   contrast = c(0, 1)
+# )
+
+# =============================================================================
+# OPTIONAL: MANUAL GATING EQUIVALENT
+# =============================================================================
+
+# Example: Gate CD3+ cells
+cd3_gate <- expr_matrix[, "CD3"] > 1  # Adjust threshold
+cd3_cells <- expr_matrix[cd3_gate, ]
+
+# Further subset CD4+ from CD3+
+cd4_gate <- cd3_cells[, "CD4"] > 1
+cd4_cells <- cd3_cells[cd4_gate, ]
+
+cat("CD3+ cells:", sum(cd3_gate), "\n")
+cat("CD4+ cells:", sum(cd4_gate), "\n")
+```
+
+This pipeline provides:
+- Data import and preprocessing
+- Quality control
+- Transformation
+- Dimensionality reduction (t-SNE and UMAP)
+- Clustering with FlowSOM
+- Comprehensive visualization
+- Results export
+
+Adjust parameters (cofactor, cluster numbers, thresholds) based on your specific data!

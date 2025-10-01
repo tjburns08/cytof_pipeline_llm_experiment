@@ -1,0 +1,245 @@
+Below is an end-to-end, single-sample CyTOF (mass cytometry) analysis pipeline. It covers QC, preprocessing, transformation, optional cleanup gates, clustering, dimensionality reduction, and exporting results. It assumes your single FCS file is already bead-normalized by the instrument or vendor software. If not, see the “Notes and options” section to add bead normalization.
+
+Summary of the pipeline
+- Input: one bead-normalized FCS file and a marker panel.
+- QC and preprocessing:
+  - Optional time-based acquisition cleanup.
+  - Remove normalization beads (if present).
+  - Keep live, singlet, DNA+ cells.
+  - Arcsinh transform (cofactor 5).
+- Analysis:
+  - Unsupervised clustering (FlowSOM + meta-clustering).
+  - UMAP or t-SNE for visualization.
+  - Marker-by-cluster medians; cluster sizes and frequencies.
+- Output:
+  - Cleaned, transformed matrix with cluster labels.
+  - UMAP/t-SNE coordinates.
+  - Cluster medians heatmap data.
+  - CSV exports for downstream work.
+
+R code template (single file)
+- Fill in: file path, key channel names (DNA, event_length, viability, bead), and your panel (markers to use for clustering). Thresholds for gating are data-dependent; the code provides safe placeholders and helper functions.
+
+```r
+# =========================
+# CyTOF single-sample pipeline
+# =========================
+
+# Install once if needed:
+# install.packages(c("flowCore","FlowSOM","uwot","data.table","ggplot2"))
+# BiocManager::install(c("CATALYST"))  # optional, for convenience wrappers
+
+library(flowCore)
+library(FlowSOM)
+library(uwot)
+library(data.table)
+library(ggplot2)
+
+# -------------------------
+# 0) User configuration
+# -------------------------
+
+fcs_file <- "path/to/your_sample.fcs"  # input FCS (bead-normalized if possible)
+out_dir  <- "cytof_output_one_sample"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Provide channel (column) names EXACTLY as in your FCS:
+# Use colnames(read.FCS(fcs_file)@parameters@data)$name to inspect
+dna1_ch         <- "Ir191Di"      # DNA1 channel name (example)
+dna2_ch         <- "Ir193Di"      # DNA2 channel name (example)
+event_length_ch <- "Event_length" # Event length channel
+time_ch         <- "Time"         # Time channel
+bead_ch         <- "Ce140Di"      # Normalization bead channel (if present)
+viability_ch    <- "Pt195Di"      # Viability (e.g., Cisplatin). Set to NA if not available.
+
+# Define your analysis markers (lineage + state) to use for clustering/UMAP
+# Exclude: Time, Event_length, Beads, DNA, viability channels
+# Replace with your actual marker/channel names as they appear in the FCS
+marker_channels <- c(
+  "CD3", "CD4", "CD8", "CD19", "CD56", "CD14", "CD16",
+  "HLA-DR", "CD45RA", "CCR7", "CD38", "CD27" # example panel
+)
+
+# Transformation cofactor (CyTOF standard):
+cofactor <- 5
+
+# Clustering parameters
+som_grid_x <- 10
+som_grid_y <- 10
+meta_k     <- 20    # number of meta-clusters (tune to your dataset)
+seed       <- 1234
+
+set.seed(seed)
+
+# -------------------------
+# 1) Read data
+# -------------------------
+ff <- read.FCS(fcs_file, transformation = FALSE, truncate_max_range = FALSE)
+expr <- exprs(ff)
+ch_names <- colnames(expr)
+
+# Helper function to check required channels exist
+assert_channels <- function(chs, names_in) {
+  missing <- setdiff(chs[!is.na(chs)], names_in)
+  if (length(missing) > 0) stop("Missing channels: ", paste(missing, collapse = ", "))
+}
+assert_channels(c(dna1_ch, dna2_ch, event_length_ch, time_ch, bead_ch, viability_ch), ch_names)
+assert_channels(marker_channels, ch_names)
+
+# -------------------------
+# 2) Basic QC: time sanity and coarse trimming (optional)
+# -------------------------
+# Optionally drop first/last 1% of acquisition time to reduce edge artifacts
+if (!is.na(time_ch)) {
+  tvals <- expr[, time_ch]
+  t_low <- quantile(tvals, 0.01, na.rm = TRUE)
+  t_high <- quantile(tvals, 0.99, na.rm = TRUE)
+  keep_time <- tvals >= t_low & tvals <= t_high
+} else {
+  keep_time <- rep(TRUE, nrow(expr))
+}
+
+# -------------------------
+# 3) Remove normalization beads (if present)
+# -------------------------
+# Simple conservative rule: remove extreme-high events in bead channel
+# Adjust the quantile if you see residual beads in downstream plots.
+if (!is.na(bead_ch)) {
+  bvals <- expr[, bead_ch]
+  bead_thr <- quantile(bvals, 0.999, na.rm = TRUE) # very high tail
+  keep_beads <- bvals < bead_thr
+} else {
+  keep_beads <- rep(TRUE, nrow(expr))
+}
+
+# -------------------------
+# 4) Keep DNA+ cells, remove debris
+# -------------------------
+# Conservative rule: keep cells above a low DNA threshold, using lower tail
+dna1 <- expr[, dna1_ch]; dna2 <- expr[, dna2_ch]
+dna1_thr <- quantile(dna1, 0.02, na.rm = TRUE)
+dna2_thr <- quantile(dna2, 0.02, na.rm = TRUE)
+keep_dna <- (dna1 > dna1_thr) & (dna2 > dna2_thr)
+
+# -------------------------
+# 5) Singlet gate via event length and DNA consistency
+# -------------------------
+el <- expr[, event_length_ch]
+el_low  <- quantile(el, 0.01, na.rm = TRUE)
+el_high <- quantile(el, 0.99, na.rm = TRUE)
+keep_el <- (el >= el_low) & (el <= el_high)
+
+# -------------------------
+# 6) Live-cell gate (if a viability channel is available)
+# -------------------------
+if (!is.na(viability_ch)) {
+  v <- expr[, viability_ch]
+  # Keep viability-negative (low signal). Using 95th percentile as cutoff is common,
+  # but adapt this using density plots for your data.
+  v_thr <- quantile(v, 0.95, na.rm = TRUE)
+  keep_viability <- v <= v_thr
+} else {
+  keep_viability <- rep(TRUE, nrow(expr))
+}
+
+# Combine all filters
+keep <- keep_time & keep_beads & keep_dna & keep_el & keep_viability
+message(sprintf("Retaining %d/%d events (%.1f%%) after QC/gating.",
+                sum(keep), nrow(expr), 100 * mean(keep)))
+
+expr_clean <- expr[keep, , drop = FALSE]
+
+# -------------------------
+# 7) Arcsinh transform for analysis markers
+# -------------------------
+# Create a copy to transform analysis channels only
+expr_trans <- expr_clean
+expr_trans[, marker_channels] <- asinh(expr_clean[, marker_channels] / cofactor)
+
+# -------------------------
+# 8) FlowSOM clustering + meta-clustering
+# -------------------------
+ff_clean <- ff[keep, ]                 # subset flowFrame to kept cells
+exprs(ff_clean) <- expr_trans          # store transformed marker values
+cols_to_use <- match(marker_channels, colnames(expr_trans))
+
+# Build FlowSOM
+fsom <- FlowSOM::ReadInput(ff_clean, transform = FALSE, scale = FALSE)
+fsom <- FlowSOM::BuildSOM(fsom, colsToUse = cols_to_use, xdim = som_grid_x, ydim = som_grid_y)
+fsom <- FlowSOM::BuildMST(fsom)
+
+# Meta-clustering (consensus)
+meta <- FlowSOM::metaClustering_consensus(fsom$map$codes, k = meta_k, seed = seed)
+cluster_ids <- meta[fsom$map$mapping[,1]]
+
+# -------------------------
+# 9) Dimensionality reduction (UMAP)
+# -------------------------
+emb <- uwot::umap(expr_trans[, marker_channels], n_neighbors = 15, min_dist = 0.2, metric = "euclidean", verbose = TRUE, ret_model = FALSE)
+
+# -------------------------
+# 10) Summaries and exports
+# -------------------------
+dt <- as.data.table(expr_trans)
+dt[, cluster := factor(cluster_ids)]
+dt[, cell_id := .I]
+dt[, UMAP1 := emb[,1]]
+dt[, UMAP2 := emb[,2]]
+
+# Cluster sizes
+cluster_counts <- dt[, .N, by = cluster][order(as.integer(as.character(cluster)))]
+setnames(cluster_counts, "N", "n_cells")
+
+# Marker medians by cluster
+cluster_medians <- dt[, lapply(.SD, median, na.rm = TRUE), by = cluster, .SDcols = marker_channels]
+
+# Save outputs
+fwrite(dt[, c("cell_id","cluster","UMAP1","UMAP2", marker_channels), with = FALSE],
+       file.path(out_dir, "cells_with_clusters_umap.csv"))
+fwrite(cluster_counts, file.path(out_dir, "cluster_counts.csv"))
+fwrite(cluster_medians, file.path(out_dir, "cluster_marker_medians.csv"))
+
+# Basic UMAP plot colored by cluster
+p <- ggplot(dt[sample(.N, min(.N, 100000))], aes(UMAP1, UMAP2, color = cluster)) +
+  geom_point(size = 0.2, alpha = 0.6) +
+  theme_minimal() +
+  guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))
+ggsave(file.path(out_dir, "umap_by_cluster.png"), p, width = 7, height = 6, dpi = 300)
+
+# Optional: heatmap-like plot of cluster medians (long format)
+med_long <- melt(cluster_medians, id.vars = "cluster", variable.name = "marker", value.name = "median")
+p2 <- ggplot(med_long, aes(x = marker, y = cluster, fill = median)) +
+  geom_tile() + scale_fill_viridis_c() + theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+ggsave(file.path(out_dir, "cluster_medians_heatmap.png"), p2, width = 8, height = 6, dpi = 300)
+
+message("Done. Outputs written to: ", normalizePath(out_dir))
+```
+
+Notes and options
+- Bead normalization (if your file is not already normalized):
+  - Recommended to use the vendor (Fluidigm/Standard BioTools) normalization at acquisition or the premessa package. Run normalization before this pipeline and point fcs_file to the normalized output.
+- Better QC/time-based cleanup:
+  - Use PeacoQC or flowCut to automatically remove unstable acquisition segments. Example packages: PeacoQC, flowCut.
+- More principled gates:
+  - Beads: gate using the specific bead channel (e.g., 140Ce) and remove Bead+ events.
+  - DNA+: find cutpoints using density minima (e.g., with flowDensity::deGate) rather than quantiles.
+  - Singlets: gate on event_length and DNA1 vs DNA2 to remove doublets.
+  - Live cells: viability-negative gate using a density-based cutpoint on cisplatin or equivalent channel.
+- Marker selection:
+  - Only include true biological markers for clustering/UMAP. Exclude Time, Event_length, DNA, beads, viability.
+- Transformation:
+  - arcsinh with cofactor 5 is standard for CyTOF. Some workflows use 4 or 5; keep consistent across analyses.
+- Clustering:
+  - meta_k should be tuned (e.g., 15–40). Inspect heatmap of cluster medians and adjust.
+- Visualization:
+  - You can also run t-SNE (Rtsne) in parallel to UMAP.
+- SingleCellExperiment/CATALYST:
+  - If you prefer an integrated SCE workflow with convenient plotting, use CATALYST::prepData, CATALYST::cluster, and CATALYST::runDR, then CATALYST::plotClusterHeatmap and CATALYST::plotDR.
+
+What to provide so I can tailor this to your file
+- The exact channel names for DNA, beads, event length, viability.
+- Your marker panel (channels to use for clustering).
+- Whether the file is already bead-normalized.
+- Any known gating thresholds or preferred QC tools (PeacoQC vs flowCut).
+- Preferred number of clusters and DR method (UMAP vs t-SNE).

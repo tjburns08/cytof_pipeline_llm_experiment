@@ -1,0 +1,411 @@
+# CyTOF Analysis Pipeline for Single File
+
+Here's a comprehensive CyTOF analysis pipeline in R for analyzing a single FCS file:
+
+```r
+# ============================================================================
+# CyTOF Single File Analysis Pipeline
+# ============================================================================
+
+# Load required libraries
+library(flowCore)
+library(CATALYST)
+library(SingleCellExperiment)
+library(ggplot2)
+library(FlowSOM)
+library(Rtsne)
+library(uwot)
+library(ConsensusClusterPlus)
+library(pheatmap)
+library(RColorBrewer)
+library(gridExtra)
+
+# ============================================================================
+# 1. DATA IMPORT AND PREPROCESSING
+# ============================================================================
+
+# Read FCS file
+fcs_file <- "path/to/your/file.fcs"
+ff <- read.FCS(fcs_file, transformation = FALSE, truncate_max_range = FALSE)
+
+# Extract expression data
+expr_data <- exprs(ff)
+print(paste("Total events:", nrow(expr_data)))
+print(paste("Total parameters:", ncol(expr_data)))
+
+# ============================================================================
+# 2. DEFINE MARKER PANELS
+# ============================================================================
+
+# Define your panel (customize based on your experiment)
+panel <- data.frame(
+  fcs_colname = colnames(ff),
+  antigen = c("CD45", "CD3", "CD4", "CD8", "CD19", "CD20", "CD56", 
+              "HLA-DR", "CD11b", "CD14", "CD16", "CD25", "CD38",
+              "Ki67", "Viability", "DNA1", "DNA2", "Bead", "Time", "Length"),
+  marker_class = c(rep("type", 13), "state", "none", "none", "none", 
+                   "none", "none", "none")
+)
+
+# Identify lineage markers (type markers)
+lineage_markers <- panel$fcs_colname[panel$marker_class == "type"]
+functional_markers <- panel$fcs_colname[panel$marker_class == "state"]
+
+# ============================================================================
+# 3. DATA CLEANING
+# ============================================================================
+
+# Remove beads (if bead channel exists)
+if("Bead" %in% panel$antigen) {
+  bead_channel <- panel$fcs_colname[panel$antigen == "Bead"]
+  expr_data <- expr_data[expr_data[, bead_channel] < 50, ]
+  print(paste("After bead removal:", nrow(expr_data)))
+}
+
+# Remove doublets based on DNA content
+if("DNA1" %in% panel$antigen) {
+  dna1_channel <- panel$fcs_colname[panel$antigen == "DNA1"]
+  dna2_channel <- panel$fcs_colname[panel$antigen == "DNA2"]
+  
+  dna_ratio <- expr_data[, dna1_channel] / expr_data[, dna2_channel]
+  singlets <- dna_ratio > 0.8 & dna_ratio < 1.2
+  expr_data <- expr_data[singlets, ]
+  print(paste("After doublet removal:", nrow(expr_data)))
+}
+
+# Remove dead cells (if viability stain exists)
+if("Viability" %in% panel$antigen) {
+  viability_channel <- panel$fcs_colname[panel$antigen == "Viability"]
+  live_cells <- expr_data[, viability_channel] < 20  # Adjust threshold
+  expr_data <- expr_data[live_cells, ]
+  print(paste("After viability filter:", nrow(expr_data)))
+}
+
+# ============================================================================
+# 4. TRANSFORMATION
+# ============================================================================
+
+# Arcsinh transformation (cofactor = 5 for CyTOF)
+cofactor <- 5
+expr_transformed <- asinh(expr_data / cofactor)
+
+# Select only relevant markers for analysis
+analysis_markers <- c(lineage_markers, functional_markers)
+expr_analysis <- expr_transformed[, analysis_markers]
+
+# ============================================================================
+# 5. QUALITY CONTROL PLOTS
+# ============================================================================
+
+# Create QC directory
+dir.create("QC_plots", showWarnings = FALSE)
+
+# Density plots for all markers
+pdf("QC_plots/marker_distributions.pdf", width = 12, height = 10)
+par(mfrow = c(4, 5))
+for(marker in analysis_markers) {
+  plot(density(expr_analysis[, marker]), 
+       main = panel$antigen[panel$fcs_colname == marker],
+       xlab = "Expression (arcsinh)", col = "blue", lwd = 2)
+}
+dev.off()
+
+# Biaxial plots for key markers
+pdf("QC_plots/biaxial_plots.pdf", width = 10, height = 10)
+par(mfrow = c(2, 2))
+sample_idx <- sample(1:nrow(expr_analysis), min(10000, nrow(expr_analysis)))
+plot(expr_analysis[sample_idx, "CD3"], expr_analysis[sample_idx, "CD19"],
+     pch = 16, cex = 0.5, col = rgb(0, 0, 1, 0.3),
+     xlab = "CD3", ylab = "CD19", main = "T cells vs B cells")
+plot(expr_analysis[sample_idx, "CD4"], expr_analysis[sample_idx, "CD8"],
+     pch = 16, cex = 0.5, col = rgb(0, 0, 1, 0.3),
+     xlab = "CD4", ylab = "CD8", main = "CD4 vs CD8 T cells")
+dev.off()
+
+# ============================================================================
+# 6. DIMENSIONALITY REDUCTION
+# ============================================================================
+
+# Downsample for visualization (if dataset is large)
+n_cells_viz <- min(20000, nrow(expr_analysis))
+sample_idx <- sample(1:nrow(expr_analysis), n_cells_viz)
+expr_sample <- expr_analysis[sample_idx, ]
+
+# t-SNE
+set.seed(42)
+tsne_result <- Rtsne(expr_sample, dims = 2, perplexity = 30, 
+                     max_iter = 1000, verbose = TRUE)
+tsne_coords <- tsne_result$Y
+colnames(tsne_coords) <- c("tSNE1", "tSNE2")
+
+# UMAP
+set.seed(42)
+umap_result <- umap(expr_sample, n_neighbors = 15, min_dist = 0.1)
+colnames(umap_result) <- c("UMAP1", "UMAP2")
+
+# Save dimensionality reduction plots
+pdf("QC_plots/dimensionality_reduction.pdf", width = 14, height = 6)
+par(mfrow = c(1, 2))
+plot(tsne_coords, pch = 16, cex = 0.5, col = rgb(0, 0, 1, 0.3),
+     main = "t-SNE", xlab = "tSNE1", ylab = "tSNE2")
+plot(umap_result, pch = 16, cex = 0.5, col = rgb(0, 0, 1, 0.3),
+     main = "UMAP", xlab = "UMAP1", ylab = "UMAP2")
+dev.off()
+
+# ============================================================================
+# 7. CLUSTERING WITH FLOWSOM
+# ============================================================================
+
+# Create flowFrame for FlowSOM
+ff_clean <- flowFrame(expr_analysis)
+
+# Run FlowSOM
+set.seed(42)
+fsom <- FlowSOM(ff_clean,
+                colsToUse = 1:ncol(expr_analysis),
+                xdim = 10, ydim = 10,
+                nClus = 20,  # Number of metaclusters
+                seed = 42)
+
+# Extract cluster assignments
+clusters <- fsom$metaclustering[fsom$FlowSOM$map$mapping[,1]]
+
+# Calculate cluster frequencies
+cluster_freq <- table(clusters) / length(clusters) * 100
+print("Cluster frequencies (%):")
+print(round(cluster_freq, 2))
+
+# ============================================================================
+# 8. CALCULATE CLUSTER STATISTICS
+# ============================================================================
+
+# Calculate median expression per cluster
+cluster_medians <- aggregate(expr_analysis, 
+                             by = list(cluster = clusters), 
+                             FUN = median)
+
+# Create heatmap of cluster phenotypes
+cluster_matrix <- as.matrix(cluster_medians[, -1])
+rownames(cluster_matrix) <- paste0("Cluster ", cluster_medians$cluster)
+colnames(cluster_matrix) <- panel$antigen[match(colnames(cluster_matrix), 
+                                                panel$fcs_colname)]
+
+# Plot heatmap
+pdf("QC_plots/cluster_heatmap.pdf", width = 10, height = 12)
+pheatmap(t(cluster_matrix),
+         scale = "none",
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         breaks = seq(-2, 4, length.out = 101),
+         cluster_rows = FALSE,
+         cluster_cols = TRUE,
+         main = "Cluster Phenotypes (Median Expression)",
+         fontsize = 10)
+dev.off()
+
+# ============================================================================
+# 9. VISUALIZE CLUSTERS ON DIMENSIONALITY REDUCTION
+# ============================================================================
+
+# Get cluster assignments for sampled cells
+clusters_sample <- clusters[sample_idx]
+
+# Create color palette
+n_clusters <- length(unique(clusters))
+cluster_colors <- rainbow(n_clusters)
+
+pdf("QC_plots/clusters_on_DR.pdf", width = 14, height = 6)
+par(mfrow = c(1, 2))
+
+# Clusters on t-SNE
+plot(tsne_coords, pch = 16, cex = 0.5, 
+     col = cluster_colors[clusters_sample],
+     main = "Clusters on t-SNE", xlab = "tSNE1", ylab = "tSNE2")
+legend("topright", legend = paste("C", 1:n_clusters), 
+       col = cluster_colors, pch = 16, cex = 0.6, ncol = 2)
+
+# Clusters on UMAP
+plot(umap_result, pch = 16, cex = 0.5, 
+     col = cluster_colors[clusters_sample],
+     main = "Clusters on UMAP", xlab = "UMAP1", ylab = "UMAP2")
+legend("topright", legend = paste("C", 1:n_clusters), 
+       col = cluster_colors, pch = 16, cex = 0.6, ncol = 2)
+
+dev.off()
+
+# ============================================================================
+# 10. MARKER EXPRESSION ON DIMENSIONALITY REDUCTION
+# ============================================================================
+
+# Plot individual markers on UMAP
+pdf("QC_plots/markers_on_UMAP.pdf", width = 16, height = 12)
+par(mfrow = c(3, 4))
+
+for(marker in analysis_markers[1:12]) {  # First 12 markers
+  marker_name <- panel$antigen[panel$fcs_colname == marker]
+  expr_values <- expr_sample[, marker]
+  
+  # Create color gradient
+  colors <- colorRampPalette(c("blue", "cyan", "yellow", "red"))(100)
+  color_idx <- cut(expr_values, breaks = 100, labels = FALSE)
+  
+  plot(umap_result, pch = 16, cex = 0.5, 
+       col = colors[color_idx],
+       main = marker_name, xlab = "UMAP1", ylab = "UMAP2")
+}
+dev.off()
+
+# ============================================================================
+# 11. EXPORT RESULTS
+# ============================================================================
+
+# Save cluster assignments
+results <- data.frame(
+  cell_id = 1:nrow(expr_analysis),
+  cluster = clusters
+)
+
+write.csv(results, "cluster_assignments.csv", row.names = FALSE)
+
+# Save cluster medians
+write.csv(cluster_medians, "cluster_medians.csv", row.names = FALSE)
+
+# Save processed data with cluster info
+expr_with_clusters <- cbind(expr_analysis, cluster = clusters)
+write.csv(expr_with_clusters, "expression_with_clusters.csv", row.names = FALSE)
+
+# Save dimensionality reduction coordinates
+dr_coords <- data.frame(
+  cell_id = sample_idx,
+  tSNE1 = tsne_coords[, 1],
+  tSNE2 = tsne_coords[, 2],
+  UMAP1 = umap_result[, 1],
+  UMAP2 = umap_result[, 2],
+  cluster = clusters_sample
+)
+write.csv(dr_coords, "dimensionality_reduction_coords.csv", row.names = FALSE)
+
+# ============================================================================
+# 12. SUMMARY REPORT
+# ============================================================================
+
+cat("\n=== CYTOF ANALYSIS SUMMARY ===\n")
+cat(paste("Input file:", fcs_file, "\n"))
+cat(paste("Total events analyzed:", nrow(expr_analysis), "\n"))
+cat(paste("Number of markers:", ncol(expr_analysis), "\n"))
+cat(paste("Number of clusters:", n_clusters, "\n"))
+cat("\nTop 5 largest clusters:\n")
+print(head(sort(cluster_freq, decreasing = TRUE), 5))
+
+cat("\n=== Analysis complete! ===\n")
+cat("Results saved in:\n")
+cat("  - cluster_assignments.csv\n")
+cat("  - cluster_medians.csv\n")
+cat("  - expression_with_clusters.csv\n")
+cat("  - dimensionality_reduction_coords.csv\n")
+cat("  - QC_plots/ directory\n")
+
+# ============================================================================
+# OPTIONAL: Statistical Tests Between Clusters
+# ============================================================================
+
+# Example: Compare two clusters
+compare_clusters <- function(cluster1, cluster2, expr_data, clusters) {
+  data1 <- expr_data[clusters == cluster1, ]
+  data2 <- expr_data[clusters == cluster2, ]
+  
+  results <- data.frame(
+    marker = colnames(expr_data),
+    median_cluster1 = apply(data1, 2, median),
+    median_cluster2 = apply(data2, 2, median),
+    fold_change = NA,
+    p_value = NA
+  )
+  
+  for(i in 1:ncol(expr_data)) {
+    results$fold_change[i] <- results$median_cluster2[i] / results$median_cluster1[i]
+    results$p_value[i] <- wilcox.test(data1[, i], data2[, i])$p.value
+  }
+  
+  results$p_adj <- p.adjust(results$p_value, method = "BH")
+  return(results)
+}
+
+# Example comparison
+# comparison <- compare_clusters(1, 2, expr_analysis, clusters)
+# write.csv(comparison, "cluster_comparison_1vs2.csv", row.names = FALSE)
+
+print("Pipeline completed successfully!")
+```
+
+## Additional Helper Functions
+
+```r
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
+
+# Function to identify cell populations
+identify_populations <- function(expr_data, clusters, panel) {
+  population_names <- character(max(clusters))
+  
+  for(i in 1:max(clusters)) {
+    cluster_data <- expr_data[clusters == i, ]
+    medians <- apply(cluster_data, 2, median)
+    
+    # Example logic for T cells
+    if(medians["CD3"] > 2) {
+      if(medians["CD4"] > 2) {
+        population_names[i] <- "CD4+ T cells"
+      } else if(medians["CD8"] > 2) {
+        population_names[i] <- "CD8+ T cells"
+      } else {
+        population_names[i] <- "T cells"
+      }
+    }
+    # Example logic for B cells
+    else if(medians["CD19"] > 2 | medians["CD20"] > 2) {
+      population_names[i] <- "B cells"
+    }
+    # Example logic for NK cells
+    else if(medians["CD56"] > 2) {
+      population_names[i] <- "NK cells"
+    }
+    # Example logic for monocytes
+    else if(medians["CD14"] > 2) {
+      population_names[i] <- "Monocytes"
+    }
+    else {
+      population_names[i] <- paste0("Cluster_", i)
+    }
+  }
+  
+  return(population_names)
+}
+
+# Function to export to Cytobank format
+export_to_cytobank <- function(fcs_file, cluster_assignments) {
+  ff <- read.FCS(fcs_file)
+  expr <- exprs(ff)
+  
+  # Add cluster column
+  expr_with_clusters <- cbind(expr, Cluster = cluster_assignments)
+  
+  # Create new flowFrame
+  ff_new <- flowFrame(expr_with_clusters)
+  
+  # Write FCS file
+  write.FCS(ff_new, "output_with_clusters.fcs")
+}
+```
+
+This pipeline provides:
+1. **Data import and preprocessing**
+2. **Quality control and filtering**
+3. **Transformation (arcsinh)**
+4. **Dimensionality reduction (t-SNE, UMAP)**
+5. **Clustering (FlowSOM)**
+6. **Visualization and QC plots**
+7. **Statistical summaries**
+8. **Export of results**
+
+Customize the marker panel, thresholds, and clustering parameters based on your specific experiment!

@@ -1,0 +1,147 @@
+Below is a complete, self-contained example of a CyTOF (Cytometry by Time-Of-Flight) analysis pipeline for a single FCS file. This pipeline is implemented in Python, as it's a popular language for bioinformatics and data analysis. It assumes you have a basic CyTOF dataset in FCS format (e.g., from a mass cytometer like Helios or CyTOF XT).
+
+### Prerequisites
+- **Software**: Python 3.x installed.
+- **Libraries**: Install the following via pip:
+  ```
+  pip install fcsparser pandas numpy scipy scikit-learn matplotlib seaborn umap-learn
+  ```
+  - `fcsparser`: For reading FCS files.
+  - `pandas`, `numpy`, `scipy`: For data manipulation.
+  - `scikit-learn`: For clustering and scaling.
+  - `matplotlib`, `seaborn`: For visualization.
+  - `umap-learn`: For dimensionality reduction (UMAP).
+
+- **Input**: A single FCS file (e.g., `sample.fcs`). Place it in the same directory as your script.
+
+This pipeline performs the following steps for one file:
+1. **Load and Preprocess Data**: Read the FCS file, clean it (e.g., remove beads, normalize).
+2. **Gating**: Basic gating to filter live cells (optional; adjust based on your markers).
+3. **Dimensionality Reduction**: Use UMAP for visualization.
+4. **Clustering**: Apply Phenograph or KMeans for cell clustering.
+5. **Visualization and Output**: Generate plots and save results.
+
+This is a high-level, simplified pipeline suitable for exploratory analysis. In a real-world scenario, you'd customize it based on your specific markers, experimental design, and biological questions (e.g., immune cell phenotyping). For production use, consider tools like Cytobank, FlowJo, or R packages (e.g., flowCore, CytoML).
+
+### Python Script: CyTOF Analysis Pipeline
+Save this as `cytof_pipeline.py` and run it with `python cytof_pipeline.py`.
+
+```python
+import fcsparser
+import pandas as pd
+import numpy as np
+from scipy import stats
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+import umap
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Step 1: Load FCS file
+def load_fcs(file_path):
+    meta, data = fcsparser.parse(file_path, meta_data_only=False, reformat_meta=False)
+    df = pd.DataFrame(data)
+    print(f"Loaded FCS file with {df.shape[0]} events and {df.shape[1]} channels.")
+    return df, meta
+
+# Step 2: Preprocess (bead removal, normalization, arcsinh transform)
+def preprocess_data(df, cofactor=5):
+    # Remove beads (assuming DNA intercalator channels like Ir191, Ir193 are for cells)
+    # Adjust thresholds based on your data
+    dna_channels = [col for col in df.columns if 'Ir191' in col or 'Ir193' in col]
+    if dna_channels:
+        df = df[(df[dna_channels[0]] > 1) & (df[dna_channels[1]] > 1)]  # Basic DNA gating for intact cells
+    
+    # Remove bead channels if present (e.g., Ce140 for calibration beads)
+    bead_channels = [col for col in df.columns if 'Ce140' in col]
+    df = df.drop(columns=bead_channels, errors='ignore')
+    
+    # Arcsinh transformation (common for CyTOF data to handle high dynamic range)
+    marker_columns = [col for col in df.columns if col not in ['Time', 'Event_length']]  # Exclude non-marker columns
+    df[marker_columns] = np.arcsinh(df[marker_columns] / cofactor)
+    
+    # Normalization (z-score)
+    scaler = StandardScaler()
+    df[marker_columns] = scaler.fit_transform(df[marker_columns])
+    
+    print(f"Preprocessed data: {df.shape[0]} events remaining.")
+    return df, marker_columns
+
+# Step 3: Basic Gating (e.g., live cells; customize based on markers like CD45, viability stain)
+def gate_data(df, marker_columns):
+    # Example: Gate on CD45+ cells (immune cells) if 'Y89_CD45' or similar exists
+    cd45_col = next((col for col in marker_columns if 'CD45' in col), None)
+    if cd45_col:
+        df = df[df[cd45_col] > 0]  # Threshold >0 after normalization
+    
+    # Example: Remove dead cells if viability channel exists (e.g., CisPt195)
+    viability_col = next((col for col in marker_columns if 'Pt195' in col or 'Viability' in col), None)
+    if viability_col:
+        df = df[df[viability_col] > -2]  # Arbitrary threshold; inspect histogram to set
+    
+    print(f"Gated data: {df.shape[0]} events remaining.")
+    return df
+
+# Step 4: Dimensionality Reduction with UMAP
+def run_umap(df, marker_columns, n_neighbors=15, min_dist=0.1):
+    reducer = umap.UMAP(n_neighbors=n_neighbors, min_dist=min_dist, metric='euclidean')
+    embedding = reducer.fit_transform(df[marker_columns])
+    df['UMAP1'] = embedding[:, 0]
+    df['UMAP2'] = embedding[:, 1]
+    return df
+
+# Step 5: Clustering (using KMeans; for more advanced, consider Phenograph via 'phenoGraph' package)
+def cluster_data(df, marker_columns, n_clusters=10):
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+    df['Cluster'] = kmeans.fit_predict(df[marker_columns])
+    return df
+
+# Step 6: Visualization
+def visualize_results(df):
+    plt.figure(figsize=(10, 8))
+    sns.scatterplot(x='UMAP1', y='UMAP2', hue='Cluster', data=df, palette='tab10', s=5)
+    plt.title('UMAP Projection with Clusters')
+    plt.savefig('umap_clusters.png')
+    plt.show()
+
+# Main Pipeline
+if __name__ == "__main__":
+    file_path = 'sample.fcs'  # Replace with your FCS file path
+    
+    # Load
+    df, meta = load_fcs(file_path)
+    
+    # Preprocess
+    df, marker_columns = preprocess_data(df)
+    
+    # Gate
+    df = gate_data(df, marker_columns)
+    
+    # UMAP
+    df = run_umap(df, marker fortaleza, n_neighbors=30, min_dist=0.3)  # Adjust params as needed
+    
+    # Cluster
+    df = cluster_data(df, marker_columns, n_clusters=8)  # Adjust n_clusters based on data
+    
+    # Visualize
+    visualize_results(df)
+    
+    # Save results
+    df.to_csv('analyzed_data.csv', index=False)
+    print("Analysis complete. Results saved to 'analyzed_data.csv' and 'umap_clusters.png'.")
+```
+
+### How to Run and Customize
+1. **Run the Script**: Replace `'sample.fcs'` with your actual file path. Execute the script in a terminal or IDE.
+2. **Output**:
+   - `analyzed_data.csv`: Processed dataframe with UMAP coordinates and cluster labels.
+   - `umap_clusters.png`: Scatter plot of UMAP with clusters.
+3. **Customization Tips**:
+   - **Markers**: Inspect `marker_columns` and adjust gating thresholds using histograms (e.g., add `df['channel'].hist()` for inspection).
+   - **Advanced Clustering**: For better results, install `phenoGraph` (via pip) and replace KMeans with it for graph-based clustering.
+   - **Batch Effects**: This is for one file, so no batch correction. For multiple files, add tools like Harmony.
+   - **Parameters**: Tune UMAP (`n_neighbors`, `min_dist`) and clustering (`n_clusters`) based on your data size and complexity.
+   - **R Alternative**: If you prefer R, use packages like `flowCore`, `CATALYST`, and `Rphenograph` for a similar pipeline.
+4. **Limitations**: This is exploratory; for publication-quality analysis, validate clusters biologically (e.g., via heatmaps of marker expression per cluster). CyTOF data can be noisy—always QC your raw data first.
+
+If you provide more details (e.g., specific markers, goals like differential abundance, or preferred language), I can refine this further!

@@ -1,0 +1,287 @@
+Of course. Here is a comprehensive and practical CyTOF (Mass Cytometry) analysis pipeline for a single `.fcs` file using the R programming language.
+
+This pipeline is designed to be a step-by-step guide, taking you from a raw data file to annotated cell populations and publication-quality visualizations. We will use the `CATALYST` package, which is a modern, powerful, and widely used framework for CyTOF analysis in R.
+
+### Pipeline Overview
+
+1.  **Setup**: Install and load necessary R packages.
+2.  **Data Loading**: Read the `.fcs` file and its corresponding panel metadata.
+3.  **Preprocessing**:
+    *   Normalization (optional, if not pre-normalized).
+    *   Quality Control (removing debris, dead cells, and doublets).
+    *   Transformation (Arcsinh).
+4.  **Dimensionality Reduction**: Visualize cells in 2D using UMAP.
+5.  **Clustering**: Automatically group similar cells together using FlowSOM.
+6.  **Annotation**: Assign biological labels (e.g., "CD4 T cells") to clusters.
+7.  **Visualization & Reporting**: Generate key plots like heatmaps, annotated UMAPs, and abundance plots.
+
+---
+
+### **Part 1: Prerequisites and Setup**
+
+#### **1. Required Software**
+*   **R**: Download and install from [CRAN](https://cran.r-project.org/).
+*   **RStudio**: A user-friendly interface for R. Download the free desktop version from [Posit](https://posit.co/download/rstudio-desktop/).
+
+#### **2. Required R Packages**
+Open RStudio and run the following commands in the console to install the necessary packages from Bioconductor and CRAN.
+
+```r
+# Install BiocManager, which is used to install Bioconductor packages
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# Install core packages for CyTOF analysis
+BiocManager::install(c("CATALYST", "flowCore", "diffcyt"))
+
+# Install packages for visualization and data handling
+install.packages(c("tidyverse", "patchwork"))
+```
+
+#### **3. Input Files**
+You need two files to start:
+*   **`your_sample.fcs`**: The raw data file from the CyTOF instrument.
+*   **`panel.csv`**: A spreadsheet detailing your antibody panel. It should have at least two columns:
+    *   `fcs_colname`: The exact name of the channel in the FCS file (e.g., `Cd19_152Sm`).
+    *   `antigen`: The clean name of the marker (e.g., `CD19`).
+    *   `marker_class`: A column to classify markers as `type` (lineage markers for cell identification) or `state` (functional/signaling markers).
+
+**Example `panel.csv`:**
+```csv
+fcs_colname,antigen,marker_class
+Ir191_191Ir,DNA1,none
+Ir193_193Ir,DNA2,none
+Ce140_140Ce,Event_length,none
+Cd45_110Cd,CD45,type
+Cd3_111Cd,CD3,type
+Cd4_112Cd,CD4,type
+Cd8a_114Cd,CD8a,type
+Cd19_152Sm,CD19,type
+pSTAT3_169Tm,pSTAT3,state
+```
+
+---
+
+### **Part 2: The Analysis Pipeline in R**
+
+#### **Step 0: Load Libraries and Set Paths**
+
+```r
+# Load all required libraries
+library(CATALYST)
+library(flowCore)
+library(tidyverse)
+library(patchwork)
+
+# --- Define file paths ---
+fcs_file <- "path/to/your_sample.fcs"
+panel_file <- "path/to/panel.csv"
+output_dir <- "path/to/your/output_folder"
+
+# Create output directory if it doesn't exist
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+#### **Step 1: Load Data and Create a SingleCellExperiment Object**
+
+The `SingleCellExperiment` (SCE) object is the central data container in `CATALYST`. It holds your expression data, cell metadata, and all analysis results.
+
+```r
+# Load the panel and metadata
+# For a single file, the metadata is simple.
+panel <- read.csv(panel_file)
+metadata <- data.frame(
+  file_name = basename(fcs_file),
+  sample_id = "Sample_A" # Give your sample a unique name
+)
+
+# Load the FCS file into a SingleCellExperiment object
+# prepData() is a CATALYST function that handles reading the FCS file
+# and organizing it based on your panel.
+sce <- prepData(
+  x = fcs_file,
+  panel = panel,
+  md = metadata,
+  transform = TRUE,      # Apply arcsinh transformation
+  cofactor = 5           # Cofactor for arcsinh transformation (5 is standard for CyTOF)
+)
+```
+
+#### **Step 2: Quality Control (Gating)**
+
+This is a critical step to remove debris, dead cells, and cell doublets. We gate based on DNA content (`DNA1`, `DNA2`) and cell size (`Event_length`).
+
+```r
+# 1. Visualize the cells to decide on gates
+p1 <- plotScatter(sce, c("DNA1", "DNA2"), label = "both")
+p2 <- plotScatter(sce, c("DNA1", "Event_length"), label = "both")
+
+# Display the plots to help determine cutoffs
+print(p1 + p2)
+
+# 2. Define the gates and filter the data
+# You must adjust these values based on your own data visualizations!
+# The goal is to keep the main cloud of single, intact cells.
+n_cells_before_qc <- nrow(colData(sce))
+
+sce <- sce[, 
+    assay(sce, "exprs")["DNA1", ] > 2.5 & 
+    assay(sce, "exprs")["DNA2", ] > 2.5 &
+    assay(sce, "exprs")["Event_length", ] < 100 
+]
+
+n_cells_after_qc <- nrow(colData(sce))
+
+# Print a summary of the filtering
+cat("Cells before QC:", n_cells_before_qc, "\n")
+cat("Cells after QC:", n_cells_after_qc, "\n")
+cat("Cells removed:", n_cells_before_qc - n_cells_after_qc, "\n")
+```
+
+#### **Step 3: Dimensionality Reduction with UMAP**
+
+UMAP (Uniform Manifold Approximation and Projection) allows us to visualize the high-dimensional data in 2D, where each point is a cell.
+
+```r
+# We run UMAP only on "type" (lineage) markers
+# This is best practice as it defines cell populations based on identity, not function.
+lineage_markers <- panel$antigen[panel$marker_class == "type"]
+
+# Set a seed for reproducibility
+set.seed(123)
+
+# Run UMAP. For speed, you can subsample cells (e.g., cells = 20000)
+sce <- runDR(
+  sce, 
+  dr = "UMAP", 
+  features = lineage_markers,
+  name = "UMAP_lineage" # Give the UMAP a unique name
+)
+
+# Visualize the UMAP, colored by a key marker (e.g., CD45)
+plotDR(sce, "UMAP_lineage", color_by = "CD45")
+```
+
+#### **Step 4: Clustering with FlowSOM**
+
+FlowSOM is a fast and robust algorithm that groups cells into clusters. `CATALYST` integrates it seamlessly.
+
+```r
+set.seed(123) # For reproducibility
+
+# Cluster cells using FlowSOM and consensus clustering
+# `maxK` is the maximum number of clusters you want to generate.
+# FlowSOM will first create many small clusters, then group them into fewer metaclusters.
+sce <- cluster(
+  sce, 
+  features = lineage_markers, 
+  xdim = 10, ydim = 10, # Dimensions of the FlowSOM grid
+  maxK = 20,           # Let's aim for 20 metaclusters
+  seed = 123
+)
+
+# Visualize the UMAP colored by the new clusters
+# The clusters are named "meta20", "meta19", etc. based on maxK
+plotDR(sce, "UMAP_lineage", color_by = "meta20")
+```
+
+#### **Step 5: Cluster Annotation**
+
+This is where your biological knowledge comes in. We use a heatmap to see the average expression of each marker in each cluster and then assign a biological name.
+
+```r
+# Generate a heatmap of median marker expression per cluster
+# This is the most important plot for annotation!
+plotExprHeatmap(
+  sce, 
+  features = lineage_markers, 
+  k = "meta20",    # The name of the clustering result
+  by = "cluster_id",
+  scale = "first" # Scale expression to be between 0 and 1 for easy comparison
+)
+```
+
+**Annotation process:**
+1.  Look at the heatmap generated above.
+2.  Examine each cluster (row) and see which markers (columns) are highly expressed.
+3.  For example, a cluster with high CD3, CD4, and low CD8 is likely "CD4+ T cells". A cluster with high CD19 is "B cells".
+4.  Create a mapping from the numeric cluster ID to your biological names.
+
+```r
+# --- MANUAL ANNOTATION STEP ---
+# This requires you to interpret the heatmap. This is just an EXAMPLE.
+# You MUST replace this with your own annotations.
+cluster_annotation <- c(
+  "1" = "CD4 T cells", "2" = "CD8 T cells", "3" = "B cells",
+  "4" = "Monocytes", "5" = "NK cells", "6" = "CD4 T cells",
+  "7" = "Granulocytes", "8" = "B cells", "9" = "CD8 T cells",
+  "10" = "Other", "11" = "Basophils", "12" = "Monocytes",
+  "13" = "pDC", "14" = "mDC", "15" = "Other", "16" = "Other",
+  "17" = "CD4 T cells", "18" = "NK cells", "19" = "Other", "20" = "Other"
+)
+
+# Add the new labels to the SCE object
+sce <- mergeClusters(sce, k = "meta20", table = cluster_annotation, id = "cell_type")
+```
+
+#### **Step 6: Final Visualizations and Reporting**
+
+Now we can create final plots using our new cell type annotations.
+
+```r
+# ---- 1. Annotated UMAP ----
+p_umap <- plotDR(sce, "UMAP_lineage", color_by = "cell_type") +
+  labs(title = "UMAP of Identified Cell Populations") +
+  theme(legend.position = "right")
+
+ggsave(file.path(output_dir, "UMAP_annotated.png"), p_umap, width = 8, height = 6)
+print(p_umap)
+
+
+# ---- 2. Heatmap with Annotated Cell Types ----
+p_heatmap <- plotExprHeatmap(
+  sce, 
+  features = lineage_markers, 
+  by = "cluster_id", 
+  k = "cell_type", # Use our new merged cell type names
+  scale = "first"
+)
+
+ggsave(file.path(output_dir, "Heatmap_annotated.png"), p_heatmap, width = 10, height = 8)
+print(p_heatmap)
+
+
+# ---- 3. Relative Abundance of Cell Types ----
+p_abund <- plotAbundances(sce, k = "cell_type", by = "sample_id") +
+  labs(title = "Relative Abundance of Cell Populations")
+
+ggsave(file.path(output_dir, "Abundances.png"), p_abund, width = 8, height = 6)
+print(p_abund)
+
+
+# ---- 4. Expression of key markers on the UMAP ----
+# Useful for sanity checks or to show expression of state markers
+markers_to_plot <- c("CD3", "CD19", "pSTAT3")
+p_exprs <- plotDR(sce, "UMAP_lineage", color_by = markers_to_plot) + 
+  plot_layout(nrow = 1)
+
+ggsave(file.path(output_dir, "UMAP_marker_expression.png"), p_exprs, width = 15, height = 5)
+print(p_exprs)
+```
+
+---
+
+### **Conclusion and Next Steps**
+
+You have now successfully processed a single CyTOF file, identified cell populations, and generated a set of core visualizations.
+
+**What you have achieved:**
+*   Cleaned and transformed your raw data.
+*   Performed dimensionality reduction (UMAP) and clustering (FlowSOM).
+*   Annotated clusters with biological cell type names.
+*   Generated publication-quality plots showing your results.
+
+**If you had multiple files, the next steps would be:**
+*   **Batch Correction**: Methods like `CyNORM` or linear modeling can be used if data was collected across different days.
+*   **Differential Abundance Analysis**: Use `diffcyt` to statistically test if the proportion of any cell type changes between experimental conditions.
+*   **Differential State Analysis**: Test if the expression of functional (`state`) markers changes on a specific cell type between conditions (e.g., is pSTAT3 higher in CD4 T cells from treated vs. control samples?).

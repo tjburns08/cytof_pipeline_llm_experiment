@@ -1,0 +1,115 @@
+Below is a complete, self-contained example of a CyTOF (Cytometry by Time-Of-Flight) analysis pipeline for processing and analyzing a single FCS (Flow Cytometry Standard) file. CyTOF data analysis typically involves loading the data, preprocessing (e.g., transformation and cleaning), clustering, dimensionality reduction, and visualization. I'll use R for this pipeline, as it's a popular choice for flow/mass cytometry with robust packages like `flowCore`, `CATALYST`, and `FlowSOM`.
+
+This pipeline assumes you have a basic understanding of R and access to a CyTOF-generated FCS file (e.g., from a mass cytometer like those from Fluidigm). If your data is in a different format or you need Python instead (e.g., using `cytofkit` or `FlowCytometryTools`), let me know for adjustments.
+
+### Prerequisites
+1. Install required R packages if you haven't already:
+   ```r
+   install.packages(c("BiocManager", "ggplot2", "dplyr"))
+   BiocManager::install(c("flowCore", "CATALYST", "FlowSOM"))
+   ```
+2. Have your FCS file ready (e.g., named `sample.fcs` in your working directory).
+
+### Pipeline Overview
+1. **Load and Preprocess Data**: Read the FCS file, apply arcsinh transformation (common for CyTOF to handle high dynamic range), and filter out debris/low-quality events.
+2. **Clustering**: Use FlowSOM for unsupervised clustering of cells based on marker expression.
+3. **Dimensionality Reduction**: Apply UMAP for visualization.
+4. **Visualization and Analysis**: Plot clusters, heatmaps, and marker expressions.
+5. **Export Results**: Save clustered data and plots.
+
+### R Code for the Pipeline
+Copy-paste this into an R script (e.g., `cytof_pipeline.R`) and run it step-by-step or as a whole.
+
+```r
+# Load libraries
+library(flowCore)
+library(CATALYST)
+library(FlowSOM)
+library(ggplot2)
+library(dplyr)
+library(RColorBrewer)  # For color palettes
+
+# Step 1: Load the FCS file
+fcs_file <- "sample.fcs"  # Replace with your file path
+flow_set <- read.flowSet(fcs_file, transformation = FALSE)  # Read as flowSet
+sce <- prepData(flow_set)  # Convert to SingleCellExperiment using CATALYST
+
+# Print summary for sanity check
+print(sce)  # Should show dimensions, markers, etc.
+
+# Step 2: Preprocessing
+# Apply arcsinh transformation (cofactor 5 is common for CyTOF)
+sce <- transform(sce, transformList(rownames(sce), arcsinhTransform(cofactor = 5)))
+
+# Optional: Filter out low-quality events (e.g., based on DNA channels like Ir191 or Ir193)
+# Assuming DNA channels are named "Ir191Di" and "Ir193Di" – adjust as needed
+sce <- filterSCE(sce, exprs(sce)["Ir191Di", ] > 1 & exprs(sce)["Ir193Di", ] > 1)  # Threshold can be tuned
+
+# Step 3: Clustering with FlowSOM
+# Select markers for clustering (exclude technical channels like Time, Event_length, DNA)
+# Assume your markers are in colnames(sce) – list them here
+clustering_markers <- colnames(sce)[grep("Cd|Pd|Sm|Eu|Gd|Tb|Dy|Ho|Er|Tm|Yb|Lu", colnames(sce))]  # Example: metal-tagged antibodies
+# Or manually: clustering_markers <- c("CD3", "CD4", "CD8", "CD45", etc.) if channels are named by antigen
+
+fsom <- FlowSOM(sce, colsToUse = clustering_markers, xdim = 10, ydim = 10, nClus = 20)  # 10x10 grid, 20 meta-clusters (tune as needed)
+sce <- UpdateSeuratObject(fsom$seurat)  # Optional: Integrate with Seurat if needed, but here we use SCE
+
+# Add cluster IDs to SCE
+sce$cluster_id <- factor(fsom$metaclustering)
+
+# Step 4: Dimensionality Reduction with UMAP
+sce <- runDR(sce, dr = "UMAP", cells = min(10000, ncol(sce)), dims = 1:10)  # Run UMAP on top 10 PCs; sample if too many cells
+
+# Step 5: Visualization
+# 5.1: UMAP plot colored by cluster
+p1 <- plotDR(sce, dr = "UMAP", color_by = "cluster_id") + 
+  theme_minimal() + 
+  ggtitle("UMAP of CyTOF Data Colored by Clusters") +
+  scale_color_manual(values = brewer.pal(20, "Set3"))  # Adjust for number of clusters
+ggsave("umap_clusters.png", p1, width = 8, height = 6)
+
+# 5.2: Heatmap of median marker expression per cluster
+# Aggregate median expression
+med_expr <- assay(sce, "exprs") %>% t() %>% as.data.frame() %>%
+  mutate(cluster = sce$cluster_id) %>%
+  group_by(cluster) %>%
+  summarise(across(all_of(clustering_markers), median))
+
+# Plot heatmap
+p2 <- pheatmap::pheatmap(med_expr[, -1], scale = "column", 
+                         cluster_rows = TRUE, cluster_cols = TRUE,
+                         main = "Median Marker Expression per Cluster")
+ggsave("marker_heatmap.png", p2$gtable, width = 10, height = 8)
+
+# 5.3: Abundance of clusters
+p3 <- plotAbundances(sce, k = "cluster_id") + 
+  theme_minimal() + 
+  ggtitle("Cluster Abundances")
+ggsave("cluster_abundances.png", p3, width = 6, height = 4)
+
+# Step 6: Export Results
+# Save clustered SCE object
+saveRDS(sce, "processed_cytof_data.rds")
+
+# Export clustered data as CSV (for further analysis)
+clustered_data <- data.frame(cluster = sce$cluster_id, t(assay(sce, "exprs")))
+write.csv(clustered_data, "clustered_cytof_data.csv", row.names = FALSE)
+
+# Print completion message
+cat("CyTOF analysis pipeline completed. Check output files in your working directory.\n")
+```
+
+### How to Run This
+1. Replace `"sample.fcs"` with your actual file path.
+2. Adjust `clustering_markers` based on your panel (CyTOF files often have channel names like "Pd102Di(CD3)").
+3. Tune parameters like `nClus` in FlowSOM or UMAP dimensions based on your data size and complexity (e.g., for 10,000–100,000 cells).
+4. Run the script in RStudio or via `Rscript cytof_pipeline.R`.
+
+### Notes and Customizations
+- **Data-Specific Adjustments**: CyTOF files vary; check your file's metadata with `flowCore::description(flow_set[[1]])` to confirm channel names.
+- **Scaling and Performance**: For very large files (>1M events), subsample with `sce <- sce[, sample(ncol(sce), 100000)]`.
+- **Alternative Tools**: If you prefer Python, I can provide a version using `fcswrite`, `pandas`, and `scanpy` (with UMAP and HDBSCAN for clustering).
+- **Validation**: Always validate clusters biologically (e.g., known immune cell types).
+- **Resources**: Refer to the CATALYST vignette (`vignette("CATALYST")`) or FlowSOM documentation for advanced tweaks.
+
+If this doesn't match your setup (e.g., specific markers, multiple files, or differential analysis), provide more details for refinements!

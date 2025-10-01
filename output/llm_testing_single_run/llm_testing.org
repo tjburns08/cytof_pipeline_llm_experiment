@@ -1,0 +1,641 @@
+#+Title: LLM Testing
+#+Author: Tyler Burns
+#+Date: September 30, 2025
+#+Purpose: testing of LLM runs prior to the big run
+
+* Gemini 2.5 pro single run
+#+begin_src sh :results output
+prompt="Please produce a CyTOF data analysis pipeline for one file."
+chatbot "geminip" "$prompt"
+#+end_src
+
+#+RESULTS:
+#+begin_example
+Of course. Here is a comprehensive, step-by-step CyTOF data analysis pipeline for a single FCS file using the R programming language. This pipeline focuses on modern, widely-accepted practices and utilizes the `CATALYST` Bioconductor package, which provides an integrated framework for many of these steps.
+
+### Conceptual Overview of the Pipeline
+
+The analysis of a a single CyTOF file follows these core stages:
+
+`Raw FCS File` -> `1. Pre-processing` -> `2. Gating/Cleaning` -> `3. Transformation` -> `4. High-Dimensional Analysis` -> `5. Visualization & Interpretation`
+
+---
+
+### Prerequisites: Setting Up Your R Environment
+
+First, you need to install the necessary R packages from Bioconductor and CRAN.
+
+```R
+# Install BiocManager if you don't have it
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+# Install required packages
+BiocManager::install(c("flowCore", "CATALYST", "ggplot2", "scater"))
+install.packages(c("uwot", "Rphenograph", "FlowSOM")) # Dependencies for clustering/DR
+```
+
+### The Analysis Pipeline
+
+Let's assume your data file is named `my_cytof_data.fcs`.
+
+#### Step 1: Data Loading and Initial Inspection
+
+The first step is to load the FCS file into R and create a `SingleCellExperiment` object, which is the standard data structure for single-cell analysis in Bioconductor.
+
+```R
+# Load necessary libraries
+library(flowCore)
+library(CATALYST)
+library(ggplot2)
+
+# --- 1. Load the FCS file ---
+# Load the raw FCS file into a flowFrame
+fcs_file <- "my_cytof_data.fcs"
+ff <- read.FCS(fcs_file, transformation = FALSE, truncate_max_range = FALSE)
+
+# --- 2. Create a Panel Dataframe ---
+# This dataframe maps channel names to marker names. It's crucial for usability.
+# You will need to create this manually based on your experiment's panel.
+panel <- data.frame(
+  fcs_colname = colnames(ff),
+  marker_name = c("Time", "Cell_length", "Bead1", "Bead2", "Bead3", "DNA1", "DNA2",
+                  "Cisplatin", "CD45", "CD3", "CD4", "CD8a", "CD19", "CD11b", "CD14",
+                  "CD16", "CD56", "FoxP3", "..."), # Add all your markers
+  marker_class = c("none", "none", "bead", "bead", "bead", "dna", "dna",
+                   "dead", "type", "type", "type", "type", "type", "state", "state",
+                   "state", "state", "state", "...") # Classify markers (type, state, none)
+)
+
+# --- 3. Create a SingleCellExperiment (SCE) object ---
+# This is the central data object for the CATALYST workflow.
+sce <- prepData(ff, panel = panel, md = list(file_id = "sample1"), transform = FALSE)
+
+# --- 4. Initial Inspection ---
+# Look at the object structure
+print(sce)
+
+# View the panel information
+rowData(sce)
+```
+
+,**Explanation:**
+,*   `read.FCS`: Loads the raw channel values from the FCS file. `transformation = FALSE` is critical because we will apply a specific transformation later.
+,*   `panel`: A metadata dataframe that makes your data human-readable. You must create this yourself. `marker_class` helps `CATALYST` know which markers to use for clustering ('type' or 'state').
+,*   `prepData`: A `CATALYST` function that converts the `flowFrame` into a more powerful `SingleCellExperiment` object.
+
+---
+
+#### Step 2: Pre-processing
+
+This stage involves correcting for signal drift and potential spillover between channels.
+
+##### a) Normalization (Bead-based)
+
+CyTOF instruments can have signal drift over time. Normalization beads are used to correct for this.
+
+```R
+# Normalize using normalization beads
+# You need to identify which beads were used in the Massey lab's bead standard.
+# For example, using 140, 151, 153, 165, 175.
+bead_channels <- c("Bead1", "Bead2", "Bead3") # Update with your bead markers
+sce <- normCytof(sce, beads = bead_channels, k = 500, remove_beads = TRUE)
+```
+,**Explanation:**
+,*   `normCytof`: This function identifies bead events, builds a regression model for signal intensity vs. time, and adjusts all other channels accordingly.
+,*   `remove_beads = TRUE`: After normalization, the bead events are no longer needed and are removed from the dataset.
+
+##### b) Spillover Correction (Optional but Recommended)
+
+If you have a spillover matrix (generated from single-stain controls), you should apply it to correct for signal leakage between channels.
+
+```R
+# Let's assume you have a spillover matrix named 'sm'
+# sm <- read.csv("spillover_matrix.csv", header = TRUE, row.names = 1)
+
+# Apply the compensation
+# sce <- compCytof(sce, sm = sm)
+# The above line is commented out as you need a real spillover matrix.
+```
+,**Explanation:** If you don't have a spillover matrix, you can skip this step. For well-designed CyTOF panels, spillover is minimal but correction is best practice.
+
+---
+
+#### Step 3: Gating (Data Cleaning)
+
+Now, we gate out unwanted events like debris, doublets, and dead cells.
+
+```R
+# --- Gate 1: Remove debris using DNA and Cell Length ---
+# Visualize to find the right thresholds
+plotScatter(sce, c("DNA1", "Cell_length"), label = "both") +
+  geom_vline(xintercept = 4) + # Example threshold for DNA
+  geom_hline(yintercept = 10)  # Example threshold for cell length
+
+# Apply the gate
+sce <- filter(sce, DNA1 > 4 & Cell_length > 10)
+
+# --- Gate 2: Remove doublets using DNA1 vs DNA2 ---
+plotScatter(sce, c("DNA1", "DNA2"), label = "both")
+
+# A simple way to gate single cells is to fit a line and take cells near it.
+# CATALYST doesn't have a direct doublet gate, but this is a common manual method.
+df <- data.frame(reducedDims(sce)$TSNE)
+names(df) <- c("DNA1", "DNA2")
+lm_fit <- lm(DNA2 ~ DNA1, data=df)
+sce$is_doublet <- abs(residuals(lm_fit)) > 1.5 # Example threshold for residuals
+
+# Visualize the doublet gate
+plotScatter(sce, c("DNA1", "DNA2"), color_by = "is_doublet")
+
+# Filter out the doublets
+sce <- filter(sce, !is_doublet)
+
+
+# --- Gate 3: Remove dead cells using Cisplatin ---
+plotScatter(sce, c("DNA1", "Cisplatin"), label = "both") +
+  geom_vline(xintercept = 5) # Example threshold
+
+# Filter out dead cells
+sce <- filter(sce, Cisplatin < 5)
+
+# Check how many cells remain
+n_cells(sce)
+```
+,**Explanation:**
+,*   We use `plotScatter` to visualize markers and determine manual thresholds.
+,*   **Debris:** Low DNA signal and small cell size.
+,*   **Doublets:** Have roughly twice the DNA content. A tight cloud on a DNA1 vs DNA2 plot indicates single cells.
+,*   **Dead Cells:** Have compromised membranes and take up DNA-intercalating dyes like Cisplatin.
+
+---
+
+#### Step 4: Arcsinh Transformation
+
+CyTOF data is not normally distributed. We apply an `asinh` transformation to stabilize the variance and make the data more suitable for downstream algorithms.
+
+```R
+# The standard cofactor for CyTOF is 5
+cofactor <- 5
+assay(sce, "exprs") <- asinh(counts(sce) / cofactor)
+
+# 'exprs' now contains the transformed data. 'counts' still holds raw data.
+```
+
+---
+
+#### Step 5: High-Dimensional Analysis (Clustering & Dimensionality Reduction)
+
+This is the core discovery part of the pipeline, where we identify cell populations automatically.
+
+##### a) Run Clustering (e.g., FlowSOM)
+
+FlowSOM is a fast and robust algorithm for identifying cell clusters.
+
+```R
+# Select markers for clustering
+type_markers <- c("CD45", "CD3", "CD4", "CD8a", "CD19", "CD11b", "CD14", "CD16", "CD56")
+
+# Run FlowSOM clustering
+set.seed(123) # for reproducibility
+sce <- cluster(sce, features = type_markers,
+               xdim = 10, ydim = 10, maxK = 20, seed = 123)
+
+# View the number of clusters found
+table(sce$cluster_id)
+```
+,**Explanation:**
+,*   `cluster()`: A wrapper function in `CATALYST` that can run FlowSOM or PhenoGraph.
+,*   `features`: We only use "type" markers (lineage markers) for clustering to define stable cell populations. "State" markers (activation markers) are used for characterization later.
+,*   `maxK`: The maximum number of *meta-clusters* to identify. The algorithm will group the initial grid of clusters into this many final populations.
+
+##### b) Run Dimensionality Reduction (e.g., UMAP)
+
+UMAP is a powerful technique for visualizing the high-dimensional data in a 2D plot.
+
+```R
+# Run UMAP on the same markers used for clustering
+sce <- runDR(sce, dr = "UMAP", cells = 5000, features = type_markers) # Use a subset of cells for speed
+```
+,**Explanation:**
+,*   `runDR()`: `CATALYST`'s function for dimensionality reduction. It can run UMAP, t-SNE, PCA, etc.
+,*   `cells = 5000`: For large datasets, running UMAP on a subset of cells is much faster and usually gives a representative view.
+
+---
+
+#### Step 6: Visualization and Interpretation
+
+Now we visualize the results to annotate the clusters and understand the cell populations.
+
+##### a) UMAP Plots
+
+```R
+# Plot UMAP colored by cluster ID
+plotDR(sce, "UMAP", color_by = "cluster_id")
+
+# Plot UMAP colored by individual marker expression to identify clusters
+plotDR(sce, "UMAP", color_by = "CD3")
+plotDR(sce, "UMAP", color_by = "CD4")
+plotDR(sce, "UMAP", color_by = "CD8a")
+plotDR(sce, "UMAP", color_by = "CD19")
+# ... and so on for all key markers
+```
+
+##### b) Heatmap
+
+A heatmap is the most important visualization for annotating clusters. It shows the median expression of each marker across all identified clusters.
+
+```R
+# Plot a heatmap of median marker expression per cluster
+plotHeatmap(sce,
+            k = "meta20", # The name of the clustering result
+            hm_pal = rev(hcl.colors(10, "YlOrRd")),
+            k_pal = hcl.colors(20, "Set 3"),
+            scale = "first") # Scale expression to be comparable between markers
+```
+
+,**Interpretation:**
+By looking at the heatmap, you can annotate your clusters. For example:
+,*   A cluster with high CD3, high CD4, and low CD8 expression is a **CD4+ T-cell**.
+,*   A cluster with high CD19 expression is a **B-cell**.
+,*   A cluster with high CD14 expression is a **Monocyte**.
+
+You can then create a new metadata column with these cell type names for easier interpretation.
+
+```R
+# Example of manually annotating clusters
+new_cluster_names <- c(
+  "1" = "CD4 T-cells", "2" = "B-cells", "3" = "NK cells", "4" = "Monocytes",
+  # ... annotate all 20 clusters based on the heatmap
+)
+
+# Add the new annotation to the sce object
+sce$cell_type <- new_cluster_names[sce$cluster_id]
+
+# Plot the UMAP with your new annotations
+plotDR(sce, "UMAP", color_by = "cell_type")
+```
+
+---
+
+This pipeline provides a complete workflow from a raw FCS file to annotated cell populations. For more complex experiments involving multiple files, the next steps would include batch correction and differential abundance/expression analysis.
+#+end_example
+* Gemini 2.5 flash lite test run
+Let's see if nerfing the power does anything:
+
+#+begin_src sh :results output
+prompt="Please produce a CyTOF data analysis pipeline for one file."
+chatbot "geminifl" "$prompt"
+#+end_src
+
+#+RESULTS:
+#+begin_example
+A CyTOF (Cytometry by Time-Of-Flight) data analysis pipeline aims to process raw, high-dimensional flow cytometry data to identify and quantify cell populations. Here's a comprehensive pipeline for analyzing a single CyTOF data file, broken down into logical steps:
+
+,**I. Data Preprocessing and Quality Control**
+
+This stage is crucial for ensuring the accuracy and reliability of your downstream analysis.
+
+1.  **Load Data:**
+    ,*   **Tool:** FlowJo, CytoScope (R/Bioconductor), Flow Cytometry Software (e.g., Luminex ones)
+    ,*   **Action:** Import the `.fcs` file into your chosen software.
+
+2.  **Manual Gating (Initial QC and Debris Removal):**
+    ,*   **Purpose:** Remove unwanted events (e.g., doublets, debris, dead cells) and establish basic cell populations.
+    ,*   **Common Gating Strategies:**
+        ,*   **Forward Scatter (FSC) vs. Side Scatter (SSC):** This is the fundamental gating step to identify single cells.
+            ,*   **FSC:** Generally correlates with cell size.
+            ,*   **SSC:** Generally correlates with internal complexity and granularity.
+        ,*   **Viability Dye Gating:** Exclude dead cells using a viability dye (e.g., Intercalator Dyes like 7-AAD, DAPI, or Ir-based viability dyes).
+        ,*   **Doublet Discrimination:** Identify and exclude events that represent two or more cells stuck together. This is often done by gating on FSC-Area vs. FSC-Height, or SSC-Area vs. SSC-Height.
+    ,*   **Visual Inspection:** Critically examine scatter plots (e.g., FSC-A vs. FSC-H, SSC-A vs. SSC-H, FSC vs. SSC) to define appropriate gates.
+
+3.  **Manual Baseline Correction/Scaling (Less Common for Raw CyTOF, but important for certain markers):**
+    ,*   **Purpose:** In some cases, you might need to adjust for instrument drift or variations in marker intensity if you notice significant shifts between experiments (though this is more a concern for multi-file analysis). For a single file, focus on ensuring consistent scaling.
+    ,*   **Tool:** FlowJo, R packages (e.g., `flowCore`)
+    ,*   **Action:** Ensure consistent compensation and scaling if applicable, though CyTOF data is typically acquired on mass spectrometers and may not require the same level of manual compensation as traditional flow cytometry.
+
+4.  **Compensation Review (if applicable for certain technologies or complex panels):**
+    ,*   **Purpose:** Correct for spectral overlap between different metal isotopes. CyTOF has significantly reduced the need for extensive compensation compared to fluorescence, but it's still good practice to check.
+    ,*   **Tool:** FlowJo, R packages (e.g., `flowCore`, `cytofkit`)
+    ,*   **Action:** Review the compensation matrix. If you have unstained controls or single-stained controls (less common for CyTOF due to the broad isotope spectrum), ensure compensation is applied accurately. Often, CyTOF data comes with pre-applied compensation.
+
+,**II. Automated Gating and Unsupervised Analysis**
+
+This is where you leverage computational tools to explore the data without pre-defined hypotheses about cell populations.
+
+1.  **Transformation (Optional but Recommended):**
+    ,*   **Purpose:** To make clustered populations more distinct, especially for markers with a wide dynamic range. Common transformations include:
+        ,*   **Arcsinh transformation (inverse hyperbolic sine):** Balances linear and logarithmic scales.
+        ,*   **Logicle transformation:** Similar to arcsinh, often used for data with a significant number of zero or very low events.
+    ,*   **Tool:** R packages (e.g., `flowCore`, `cytofkit`), FlowJo
+    ,*   **Action:** Apply the chosen transformation to your marker channels.
+
+2.  **Downsampling (Optional):**
+    ,*   **Purpose:** For very large datasets, downsampling can speed up computation without significantly impacting the results.
+    ,*   **Tool:** R packages (e.g., `flowCore`)
+    ,*   **Action:** Randomly select a subset of events from your FCS file. Ensure the downsampling is large enough to represent the full diversity of cell populations.
+
+3.  **Clustering (Unsupervised Cell Population Identification):**
+    ,*   **Purpose:** To group cells with similar marker expression profiles, thus identifying distinct cell populations without prior manual gating.
+    ,*   **Common Algorithms:**
+        ,*   **FlowSOM:** (Flow Self-Organizing Maps) - a popular algorithm for CyTOF.
+        ,*   **PhenoGraph:** Based on k-nearest neighbors and graph-based clustering.
+        ,*   **SPADE:** (Spanning Tree Progression Analysis of Density-Normalized Events) - identifies hierarchical relationships between cell clusters.
+        ,*   **Citrus:** A machine learning approach for identifying differentially abundant cell populations.
+        ,*   **scran (for single-cell RNA-seq, can be adapted):** Algorithms like `cluster` or `findMarkers`.
+    ,*   **Tool:** `FlowSOM` (R/Bioconductor), `cytofkit` (R/Bioconductor), `PhenoGraph` (Python, or R implementation), `SPADE` (R/Bioconductor)
+    ,*   **Action:**
+        ,*   **Select Markers:** Choose the relevant marker channels for clustering. Some markers (e.g., lineage markers, housekeeping genes) might be excluded if they are not informative for differentiating your cell types of interest.
+        ,*   **Run Clustering Algorithm:** Apply your chosen algorithm to the transformed and potentially downsampled data.
+        ,*   **Determine Number of Clusters (k):** This is often an iterative process. You might use metrics like silhouette scores or visual inspection of cluster separation. Some algorithms (like FlowSOM) use meta-clustering to group initial clusters into broader cell types.
+
+4.  **Visualization of Clusters:**
+    ,*   **Purpose:** To visualize the identified cell populations and their marker expression.
+    ,*   **Common Visualization Techniques:**
+        ,*   **t-SNE (t-Distributed Stochastic Neighbor Embedding):** Reduces high-dimensional data to 2D for visualization, preserving local structure.
+        ,*   **UMAP (Uniform Manifold Approximation and Projection):** Similar to t-SNE but often better at preserving global structure.
+        ,*   **DimRed (Dimensionality Reduction):** PCA (Principal Component Analysis), Isomap, etc.
+        ,*   **Heatmaps:** Display the median marker expression for each cluster.
+        ,*   **Pairwise scatter plots:** Show relationships between key markers for different clusters.
+    ,*   **Tool:** `Rtsne`, `umap` (R packages), `ggplot2` (R package), `cytofkit` provides integrated visualization.
+    ,*   **Action:** Generate 2D plots (t-SNE, UMAP) where each point represents a cell, colored by its assigned cluster. Generate heatmaps or bar plots showing the median intensity of each marker for each cluster.
+
+,**III. Manual Interpretation and Annotation of Clusters**
+
+This is where biological knowledge is applied to understand what the identified clusters represent.
+
+1.  **Marker Expression Profiling:**
+    ,*   **Purpose:** To understand the characteristic marker expression profile of each identified cluster.
+    ,*   **Action:** Examine the heatmaps, bar plots, or direct plots of marker expression for each cluster. Identify which markers are highly expressed, lowly expressed, or absent in each population.
+
+2.  **Annotation of Cell Populations:**
+    ,*   **Purpose:** To assign biological identities to the identified clusters based on their marker expression profiles and your knowledge of the cell types you expect to find.
+    ,*   **Example Annotation:**
+        ,*   Cluster 1: CD4+ T cells (e.g., high CD3, CD4, moderate TCRgd, low CD8)
+        ,*   Cluster 2: CD8+ T cells (e.g., high CD3, CD8, moderate TCRgd, low CD4)
+        ,*   Cluster 3: Monocytes (e.g., high CD14, CD11b, low CD3)
+        ,*   Cluster 4: B cells (e.g., high CD19, CD20, low CD3)
+        ,*   Cluster 5: NK cells (e.g., high CD56, CD16, low CD3)
+    ,*   **Action:** Use your knowledge of immunology and/or the specific research question to label each cluster with a relevant cell type or subset. If you have reference datasets or known markers for specific populations, leverage them.
+
+3.  **Manual Gating of Key Populations (Optional - Validation/Refinement):**
+    ,*   **Purpose:** In some cases, you might want to manually gate certain well-defined populations (e.g., CD4 T cells) to confirm that your unsupervised clustering has correctly identified them and to compare the manual and automated results.
+    ,*   **Action:** Draw gates for specific cell types using the characterized marker expression.
+
+,**IV. Downstream Analysis and Interpretation**
+
+This stage involves quantifying, comparing, and drawing conclusions from your identified cell populations.
+
+1.  **Quantification of Cell Populations:**
+    ,*   **Purpose:** To determine the proportion or absolute number of cells in each identified population.
+    ,*   **Action:** Calculate the percentage of cells within each cluster relative to the total viable singlets, or the absolute cell counts if you have an internal bead standard.
+
+2.  **Differential Abundance Analysis (if comparing to other files/conditions - not applicable for a single file, but good to mention for context):**
+    ,*   **Purpose:** To identify cell populations that are significantly different in abundance between experimental groups.
+    ,*   **Tools:** `diffcyt` (R/Bioconductor), `CellCnn` (R), `comBat` (for batch correction).
+    ,*   **Action:** Apply differential abundance testing methods.
+
+3.  **Differential Marker Expression Analysis (if comparing to other files/conditions):**
+    ,*   **Purpose:** To identify markers that are differentially expressed within a specific cell population across experimental groups.
+    ,*   **Tools:** `diffcyt` (R/Bioconductor), `scran` (R/Bioconductor).
+    ,*   **Action:** Apply differential expression testing methods.
+
+4.  **Visualization of Key Findings:**
+    ,*   **Purpose:** To present your results clearly and effectively.
+    ,*   **Action:** Create plots showing:
+        ,*   **Bar plots/Pie charts:** Proportions of major cell types.
+        ,*   **Violin plots/Box plots:** Distribution of a specific marker within a population.
+        ,*   **Dot plots:** Median marker expression across populations.
+        ,*   **Heatmaps with annotated clusters:** Overall marker expression landscape.
+        ,*   **Summary tables:** Counts and percentages of key cell populations.
+
+5.  **Biological Interpretation:**
+    ,*   **Purpose:** To translate your findings into biological insights and answer your research questions.
+    ,*   **Action:** Link the identified cell populations and their characteristics to the experimental context. Discuss the functional implications of the observed cell populations and their numbers.
+
+,**Tools and Software Recommendations:**
+
+,*   **Comprehensive R Bioconductor Packages:**
+    ,*   `flowCore`: For reading and manipulating FCS files.
+    ,*   `cytofkit`: An integrated package for the entire CyTOF analysis workflow, from QC to visualization and unsupervised analysis. Highly recommended.
+    ,*   `FlowSOM`: For Flow Self-Organizing Maps clustering.
+    ,*   `citrus`: For Citrus clustering.
+    ,*   `Rtsne`, `umap`: For dimensionality reduction and visualization.
+    ,*   `ggplot2`: For advanced plotting.
+    ,*   `Spectre ` : Another package that provides a streamlined workflow for CyTOF data.
+,*   **Commercial Software:**
+    ,*   **FlowJo:** A widely used and powerful platform for manual and automated flow cytometry analysis.
+,*   **Other:**
+    ,*   **Cytobank:** A cloud-based platform for flow cytometry data analysis and sharing.
+
+,**Workflow Summary for a Single File:**
+
+1.  **Load and Inspect:** Import FCS, check basic QC (FSC/SSC, viability).
+2.  **Transform:** Apply arcsinh or logicle.
+3.  **Downsample (Optional):** For speed.
+4.  **Cluster:** Use FlowSOM, PhenoGraph, or other algorithms on selected markers.
+5.  **Visualize Clusters:** Use t-SNE or UMAP.
+6.  **Profile Markers:** Generate heatmaps/bar plots of marker expression per cluster.
+7.  **Annotate:** Assign biological labels to clusters based on marker expression.
+8.  **Quantify:** Calculate proportions of annotated populations.
+9.  **Interpret:** Draw biological conclusions.
+
+This pipeline provides a structured approach to analyzing your single CyTOF data file. Remember that CyTOF analysis is often iterative, and you may need to revisit certain steps as you gain insights into your data. Always critically evaluate your results and consider potential biases or limitations.
+#+end_example
+
+Note that no code was used here. This is interesting. So gemini will use code, but the lesser models will not. Let's keep the prompt as vague as possible in this regard.
+* gemini 2.5 pro refined prompt
+We are going to use a maximally prompt engineered (by the AI itself) prompt.
+#+begin_src sh :results output
+prompt="Please produce a CyTOF data analysis pipeline for one file. Emit only runnable code with a short metadata header.
+Output rules (strict)
+1) Output **exactly one** fenced code block containing a **single, fully runnable script**. No prose.
+2) The script’s **first 12 lines** must be a plain-text header in comment lines (no JSON), one `key: value` per line, with at least these keys (use `N/A` if unknown):
+RUN_ID: {{value}}
+SEED: {{value}}
+language: {{free text}}
+frameworks: {{free text}}
+qc_methods: {{free text}}
+transform: {{free text}}
+dimensional_reduction: {{free text}}
+clustering: {{free text}}
+file_outputs: {{comma-separated filenames}}
+assumptions: {{free text}}
+fallbacks: {{free text}}
+novelty_tag: {{very short phrase}}"
+chatbot "geminip" "$prompt"
+#+end_src
+
+#+RESULTS:
+#+begin_example
+```r
+# RUN_ID: {{RUN_ID}}
+# SEED: {{integer or blank}}
+# language: R
+# frameworks: Bioconductor, flowCore, FlowSOM, umap, pheatmap
+# qc_methods: Filtering non-protein channels based on name patterns
+# transform: arcsinh (cofactor=5)
+# dimensional_reduction: UMAP
+# clustering: FlowSOM with consensus meta-clustering
+# file_outputs: umap_clusters.png, umap_markers.png, cluster_heatmap.png, processed_data_with_clusters.csv, cluster_median_expression.csv
+# assumptions: FCS file is compensated. Protein markers are distinguishable by name from non-protein channels (e.g., Time, Event_length).
+# fallbacks: If N_CELLS exceeds actual cell count, all cells will be used. Script will error if essential packages are not installable.
+# novelty_tag: Standard CyTOF workflow
+
+### --- Script Configuration ---
+# Use placeholders here, which will be replaced by the execution environment.
+# For direct execution, replace the placeholder values manually.
+SEED         <- "{{integer or blank}}"
+N_CELLS      <- "{{integer or blank}}"
+FCS_FILE     <- "{{path/to/file.fcs}}"
+OUTPUT_DIR   <- "{{outputs/run_{{RUN_ID}}}}"
+COFACTOR     <- 5 # Arcsinh transformation cofactor
+MAX_K        <- 20 # Max number of metaclusters for FlowSOM
+
+### --- 1. Setup Environment ---
+# Function to install packages if they are not already installed
+install_if_missing <- function(packages) {
+  new_packages <- packages[!(packages %in% installed.packages()[, "Package"])]
+  if (length(new_packages) > 0) {
+    if (!requireNamespace("BiocManager", quietly = TRUE))
+      install.packages("BiocManager")
+    BiocManager::install(new_packages)
+  }
+}
+
+# Install required packages
+required_packages <- c("flowCore", "FlowSOM", "ggplot2", "pheatmap", "umap", "RColorBrewer", "patchwork")
+install_if_missing(required_packages)
+
+# Load libraries
+suppressPackageStartupMessages({
+  library(flowCore)
+  library(FlowSOM)
+  library(ggplot2)
+  library(pheatmap)
+  library(umap)
+  library(patchwork)
+})
+
+# Set seed for reproducibility if provided
+if (is.numeric(SEED) && !is.na(SEED)) {
+  set.seed(SEED)
+  message(paste("Setting random seed to:", SEED))
+}
+
+# Create output directory
+if (!dir.exists(OUTPUT_DIR)) {
+  dir.create(OUTPUT_DIR, recursive = TRUE)
+}
+
+### --- 2. Load and Preprocess Data ---
+message("Loading FCS file...")
+fcs_raw <- read.FCS(FCS_FILE, transformation = FALSE, truncate_max_range = FALSE)
+
+message("Preprocessing data...")
+# Identify markers to use for analysis (exclude time, scatter, etc.)
+marker_names <- fcs_raw@parameters@data$name
+channel_names <- fcs_raw@parameters@data$desc
+channel_names[is.na(channel_names)] <- marker_names[is.na(channel_names)]
+
+non_metal_cols <- grepl("FSC|SSC|Time|Event_length|Center|Offset|Width|Residual", channel_names, ignore.case = TRUE)
+analysis_markers <- channel_names[!non_metal_cols]
+message(paste("Found", length(analysis_markers), "markers for analysis."))
+
+# Arcsinh transformation
+transformList <- transformList(from = analysis_markers, tfun = function(x) asinh(x / COFACTOR))
+fcs_transformed <- transform(fcs_raw, transformList)
+
+# Subsample if N_CELLS is specified
+expr_matrix <- exprs(fcs_transformed)
+n_total_cells <- nrow(expr_matrix)
+if (is.numeric(N_CELLS) && !is.na(N_CELLS) && N_CELLS > 0 && N_CELLS < n_total_cells) {
+  message(paste("Subsampling to", N_CELLS, "cells."))
+  sample_indices <- sample(1:n_total_cells, N_CELLS, replace = FALSE)
+  expr_matrix <- expr_matrix[sample_indices, ]
+} else {
+  message("Using all cells.")
+}
+
+analysis_matrix <- expr_matrix[, analysis_markers]
+
+### --- 3. Dimensionality Reduction (UMAP) ---
+message("Running UMAP...")
+umap_config <- umap.defaults
+umap_config$n_neighbors <- 15
+umap_config$min_dist <- 0.2
+umap_results <- umap(analysis_matrix, config = umap_config)
+umap_df <- as.data.frame(umap_results$layout)
+colnames(umap_df) <- c("UMAP1", "UMAP2")
+
+### --- 4. Clustering (FlowSOM) ---
+message("Running FlowSOM clustering...")
+# Build the SOM
+fsom <- ReadInput(fcs_transformed, transform = FALSE, scale = TRUE)
+fsom <- BuildSOM(fsom, colsToUse = analysis_markers, xdim=10, ydim=10) # 10x10 SOM grid
+# Metaclustering
+fsom <- MetaClustering(fsom, method = "metaClustering_consensus", max = MAX_K)
+cluster_labels <- GetClusters(fsom)[rownames(analysis_matrix)] # Ensure labels match sampled cells
+
+# Add UMAP and cluster results to a single data frame
+results_df <- cbind(umap_df, analysis_matrix, cluster = as.factor(cluster_labels))
+
+### --- 5. Visualization and Export ---
+message("Generating plots and saving results...")
+
+# A. UMAP plot colored by clusters
+n_clusters <- length(unique(results_df$cluster))
+qual_col_pals <- brewer.pal.info[brewer.pal.info$category == 'qual',]
+col_vector <- unlist(mapply(brewer.pal, qual_col_pals$maxcolors, rownames(qual_col_pals)))
+
+p_cluster <- ggplot(results_df, aes(x = UMAP1, y = UMAP2, color = cluster)) +
+  geom_point(size = 0.5, alpha = 0.8) +
+  scale_color_manual(values = colorRampPalette(col_vector)(n_clusters)) +
+  labs(title = "UMAP Colored by FlowSOM Metacluster", color = "Cluster") +
+  theme_bw() +
+  guides(color = guide_legend(override.aes = list(size = 3)))
+
+ggsave(file.path(OUTPUT_DIR, "umap_clusters.png"), p_cluster, width = 8, height = 7, dpi = 300)
+
+# B. UMAP plots colored by marker expression
+plot_list <- lapply(analysis_markers, function(marker) {
+  ggplot(results_df, aes(x = UMAP1, y = UMAP2, color = .data[[marker]])) +
+    geom_point(size = 0.3) +
+    scale_color_viridis_c(option = "plasma") +
+    labs(title = marker) +
+    theme_void() +
+    theme(legend.position = "none", plot.title = element_text(size = 8, hjust = 0.5))
+})
+
+p_markers <- wrap_plots(plot_list)
+ggsave(file.path(OUTPUT_DIR, "umap_markers.png"), p_markers, width = 12, height = 12, dpi = 300)
+
+# C. Heatmap of median marker expression per cluster
+cluster_medians <- aggregate(. ~ cluster, data = results_df[, c(analysis_markers, "cluster")], FUN = median)
+rownames(cluster_medians) <- paste0("Cluster_", cluster_medians$cluster)
+cluster_medians$cluster <- NULL
+cluster_medians_scaled <- t(scale(t(cluster_medians))) # Scale per marker
+
+p_heatmap <- pheatmap(
+  cluster_medians_scaled,
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  color = colorRampPalette(rev(brewer.pal(n = 11, name = "RdYlBu")))(100),
+  main = "Median Marker Expression per Cluster (Z-score scaled)",
+  fontsize_row = 8,
+  fontsize_col = 8,
+  filename = file.path(OUTPUT_DIR, "cluster_heatmap.png"),
+  width = 10,
+  height = 8
+)
+
+# D. Save data tables
+write.csv(results_df, file = file.path(OUTPUT_DIR, "processed_data_with_clusters.csv"), row.names = FALSE)
+write.csv(cluster_medians, file = file.path(OUTPUT_DIR, "cluster_median_expression.csv"), row.names = TRUE)
+
+message(paste("Analysis complete. Outputs are saved in:", OUTPUT_DIR))
+```
+#+end_example
+
+Ran it twice. I am wondering if this plot constrains the model and biases the model. I am interested mainly in the full latent space if we give the model absolute freedom. In this regard, a vague prompt might actually be more interesting.

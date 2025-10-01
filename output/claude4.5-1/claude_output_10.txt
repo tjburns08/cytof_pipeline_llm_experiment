@@ -1,0 +1,358 @@
+# CyTOF Analysis Pipeline for Single File
+
+Here's a comprehensive CyTOF analysis pipeline in R for processing one FCS file:
+
+```r
+# ============================================================================
+# CyTOF Single File Analysis Pipeline
+# ============================================================================
+
+# Install required packages (run once)
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+packages <- c("flowCore", "FlowSOM", "Rtsne", "ggplot2", "uwot", 
+              "ConsensusClusterPlus", "cytofkit", "CATALYST")
+BiocManager::install(setdiff(packages, rownames(installed.packages())))
+
+# Load libraries
+library(flowCore)
+library(FlowSOM)
+library(Rtsne)
+library(uwot)
+library(ggplot2)
+library(ComplexHeatmap)
+library(viridis)
+
+# ============================================================================
+# 1. DATA IMPORT
+# ============================================================================
+
+# Read FCS file
+fcs_file <- "your_file.fcs"
+fcs_data <- read.FCS(fcs_file, transformation = FALSE, truncate_max_range = FALSE)
+
+# Extract expression matrix
+expr_matrix <- exprs(fcs_data)
+print(paste("Total events:", nrow(expr_matrix)))
+print(paste("Total parameters:", ncol(expr_matrix)))
+
+# View parameter names
+params <- parameters(fcs_data)
+print(params@data[, c("name", "desc")])
+
+# ============================================================================
+# 2. DATA PREPROCESSING
+# ============================================================================
+
+# Define marker panels (customize based on your panel)
+lineage_markers <- c("CD3", "CD4", "CD8", "CD19", "CD14", "CD16", 
+                      "CD56", "CD11c", "HLA-DR")
+functional_markers <- c("IFNg", "TNFa", "IL2", "IL4", "IL17", "Granzyme B")
+
+# Select markers of interest (adjust column names/indices as needed)
+# Option 1: By marker name
+marker_cols <- which(params@data$desc %in% c(lineage_markers, functional_markers))
+
+# Option 2: Manually specify column indices
+# marker_cols <- c(5:15, 20:25)  # adjust to your data
+
+expr_subset <- expr_matrix[, marker_cols]
+marker_names <- params@data$desc[marker_cols]
+colnames(expr_subset) <- marker_names
+
+# ============================================================================
+# 3. QUALITY CONTROL
+# ============================================================================
+
+# Remove events with extreme values (beads, debris)
+# Identify DNA channels (usually Iridium)
+dna_channels <- grep("DNA|191|193", colnames(expr_matrix), ignore.case = TRUE)
+
+if(length(dna_channels) > 0) {
+    dna_signal <- rowSums(expr_matrix[, dna_channels])
+    
+    # Plot DNA signal distribution
+    pdf("QC_DNA_distribution.pdf", width = 8, height = 6)
+    hist(asinh(dna_signal/5), breaks = 100, main = "DNA Signal Distribution",
+         xlab = "asinh(DNA signal)")
+    abline(v = c(3, 6), col = "red", lty = 2)
+    dev.off()
+    
+    # Filter cells based on DNA content
+    dna_filter <- dna_signal > quantile(dna_signal, 0.05) & 
+                  dna_signal < quantile(dna_signal, 0.95)
+    expr_subset <- expr_subset[dna_filter, ]
+    print(paste("Events after DNA filtering:", nrow(expr_subset)))
+}
+
+# Remove events with all zero values
+zero_filter <- rowSums(expr_subset == 0) < ncol(expr_subset) * 0.5
+expr_subset <- expr_subset[zero_filter, ]
+print(paste("Events after zero filtering:", nrow(expr_subset)))
+
+# ============================================================================
+# 4. DATA TRANSFORMATION
+# ============================================================================
+
+# Arcsinh transformation (standard for CyTOF)
+cofactor <- 5  # typical for CyTOF data
+expr_transformed <- asinh(expr_subset / cofactor)
+
+# Check transformation
+pdf("transformation_check.pdf", width = 12, height = 8)
+par(mfrow = c(2, 3))
+for(i in 1:min(6, ncol(expr_transformed))) {
+    hist(expr_transformed[, i], breaks = 100, 
+         main = paste("Transformed:", colnames(expr_transformed)[i]),
+         xlab = "Expression", col = "steelblue")
+}
+dev.off()
+
+# ============================================================================
+# 5. DIMENSIONALITY REDUCTION
+# ============================================================================
+
+# Subsample for faster computation (if needed)
+max_cells <- 50000
+if(nrow(expr_transformed) > max_cells) {
+    set.seed(42)
+    subsample_idx <- sample(1:nrow(expr_transformed), max_cells)
+    expr_for_dr <- expr_transformed[subsample_idx, ]
+} else {
+    expr_for_dr <- expr_transformed
+    subsample_idx <- 1:nrow(expr_transformed)
+}
+
+# --- t-SNE ---
+print("Running t-SNE...")
+set.seed(42)
+tsne_result <- Rtsne(expr_for_dr, 
+                     dims = 2, 
+                     perplexity = 30,
+                     max_iter = 1000,
+                     check_duplicates = FALSE)
+
+tsne_coords <- as.data.frame(tsne_result$Y)
+colnames(tsne_coords) <- c("tSNE1", "tSNE2")
+
+# --- UMAP ---
+print("Running UMAP...")
+set.seed(42)
+umap_result <- umap(expr_for_dr, 
+                    n_neighbors = 15,
+                    min_dist = 0.1,
+                    metric = "euclidean")
+
+umap_coords <- as.data.frame(umap_result)
+colnames(umap_coords) <- c("UMAP1", "UMAP2")
+
+# ============================================================================
+# 6. CLUSTERING
+# ============================================================================
+
+# --- FlowSOM clustering ---
+print("Running FlowSOM clustering...")
+fsom <- FlowSOM(expr_for_dr,
+                colsToUse = 1:ncol(expr_for_dr),
+                xdim = 10, ydim = 10,
+                nClus = 20,  # adjust number of metaclusters
+                seed = 42)
+
+clusters <- GetMetaclusters(fsom)
+
+# Add clusters to coordinates
+tsne_coords$cluster <- as.factor(clusters)
+umap_coords$cluster <- as.factor(clusters)
+
+# ============================================================================
+# 7. VISUALIZATION
+# ============================================================================
+
+# --- t-SNE plots ---
+pdf("tSNE_plots.pdf", width = 16, height = 12)
+
+# Cluster overlay
+p1 <- ggplot(tsne_coords, aes(x = tSNE1, y = tSNE2, color = cluster)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    theme_minimal() +
+    labs(title = "t-SNE: Clusters") +
+    theme(legend.position = "right")
+print(p1)
+
+# Marker expression overlays
+for(marker in colnames(expr_for_dr)) {
+    tsne_coords$marker_expr <- expr_for_dr[, marker]
+    
+    p <- ggplot(tsne_coords, aes(x = tSNE1, y = tSNE2, color = marker_expr)) +
+        geom_point(size = 0.5, alpha = 0.6) +
+        scale_color_viridis(option = "magma") +
+        theme_minimal() +
+        labs(title = paste("t-SNE:", marker), color = "Expression") +
+        theme(legend.position = "right")
+    print(p)
+}
+
+dev.off()
+
+# --- UMAP plots ---
+pdf("UMAP_plots.pdf", width = 16, height = 12)
+
+# Cluster overlay
+p1 <- ggplot(umap_coords, aes(x = UMAP1, y = UMAP2, color = cluster)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    theme_minimal() +
+    labs(title = "UMAP: Clusters") +
+    theme(legend.position = "right")
+print(p1)
+
+# Marker expression overlays
+for(marker in colnames(expr_for_dr)) {
+    umap_coords$marker_expr <- expr_for_dr[, marker]
+    
+    p <- ggplot(umap_coords, aes(x = UMAP1, y = UMAP2, color = marker_expr)) +
+        geom_point(size = 0.5, alpha = 0.6) +
+        scale_color_viridis(option = "magma") +
+        theme_minimal() +
+        labs(title = paste("UMAP:", marker), color = "Expression") +
+        theme(legend.position = "right")
+    print(p)
+}
+
+dev.off()
+
+# ============================================================================
+# 8. CLUSTER CHARACTERIZATION
+# ============================================================================
+
+# Calculate median marker expression per cluster
+cluster_medians <- matrix(0, nrow = length(unique(clusters)), 
+                          ncol = ncol(expr_for_dr))
+colnames(cluster_medians) <- colnames(expr_for_dr)
+rownames(cluster_medians) <- paste0("Cluster_", sort(unique(clusters)))
+
+for(i in sort(unique(clusters))) {
+    cluster_cells <- expr_for_dr[clusters == i, ]
+    cluster_medians[paste0("Cluster_", i), ] <- apply(cluster_cells, 2, median)
+}
+
+# Heatmap of cluster markers
+pdf("cluster_heatmap.pdf", width = 10, height = 12)
+Heatmap(cluster_medians,
+        name = "Expression",
+        col = viridis(100),
+        cluster_rows = TRUE,
+        cluster_columns = TRUE,
+        show_row_names = TRUE,
+        show_column_names = TRUE,
+        column_names_rot = 45,
+        row_names_side = "left",
+        column_title = "Marker Expression per Cluster")
+dev.off()
+
+# Cluster frequencies
+cluster_freq <- table(clusters)
+cluster_prop <- prop.table(cluster_freq) * 100
+
+pdf("cluster_frequencies.pdf", width = 10, height = 6)
+barplot(cluster_prop, 
+        main = "Cluster Frequencies",
+        xlab = "Cluster",
+        ylab = "Percentage of cells",
+        col = viridis(length(cluster_freq)),
+        las = 2)
+dev.off()
+
+# ============================================================================
+# 9. EXPORT RESULTS
+# ============================================================================
+
+# Save cluster assignments
+results_df <- data.frame(
+    event_id = subsample_idx,
+    cluster = clusters,
+    tSNE1 = tsne_coords$tSNE1,
+    tSNE2 = tsne_coords$tSNE2,
+    UMAP1 = umap_coords$UMAP1,
+    UMAP2 = umap_coords$UMAP2
+)
+
+write.csv(results_df, "cluster_assignments.csv", row.names = FALSE)
+write.csv(cluster_medians, "cluster_median_expression.csv")
+write.csv(data.frame(Cluster = names(cluster_prop), 
+                     Frequency = as.vector(cluster_prop)),
+          "cluster_frequencies.csv", row.names = FALSE)
+
+# Save R objects
+save(fsom, tsne_result, umap_result, clusters, 
+     file = "cytof_analysis_results.RData")
+
+print("Analysis complete! Check output files.")
+
+# ============================================================================
+# 10. SUMMARY STATISTICS
+# ============================================================================
+
+cat("\n=== ANALYSIS SUMMARY ===\n")
+cat(paste("Input file:", fcs_file, "\n"))
+cat(paste("Total events analyzed:", nrow(expr_for_dr), "\n"))
+cat(paste("Number of markers:", ncol(expr_for_dr), "\n"))
+cat(paste("Number of clusters:", length(unique(clusters)), "\n"))
+cat("\nMarkers analyzed:\n")
+print(colnames(expr_for_dr))
+cat("\nCluster sizes:\n")
+print(cluster_freq)
+
+```
+
+## Additional Analysis: Manual Gating Alternative
+
+```r
+# ============================================================================
+# OPTIONAL: Manual Gating Analysis
+# ============================================================================
+
+# Define gates based on marker expression
+gate_cd3_pos <- expr_transformed[, "CD3"] > 2
+gate_cd4_pos <- expr_transformed[, "CD4"] > 2
+gate_cd8_pos <- expr_transformed[, "CD8"] > 2
+
+# Create population definitions
+populations <- data.frame(
+    CD3pos = gate_cd3_pos,
+    CD4_T = gate_cd3_pos & gate_cd4_pos & !gate_cd8_pos,
+    CD8_T = gate_cd3_pos & gate_cd8_pos & !gate_cd4_pos,
+    DN_T = gate_cd3_pos & !gate_cd4_pos & !gate_cd8_pos
+)
+
+# Calculate population frequencies
+pop_freq <- colSums(populations[subsample_idx, ]) / nrow(populations[subsample_idx, ]) * 100
+
+print("Population Frequencies (%):")
+print(pop_freq)
+
+# Overlay populations on UMAP
+umap_coords$population <- "Other"
+umap_coords$population[populations$CD4_T[subsample_idx]] <- "CD4+ T"
+umap_coords$population[populations$CD8_T[subsample_idx]] <- "CD8+ T"
+umap_coords$population[populations$DN_T[subsample_idx]] <- "DN T"
+
+pdf("UMAP_populations.pdf", width = 10, height = 8)
+ggplot(umap_coords, aes(x = UMAP1, y = UMAP2, color = population)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    theme_minimal() +
+    labs(title = "UMAP: Manual Gating Populations")
+dev.off()
+```
+
+This pipeline includes:
+1. **Data import** and parameter inspection
+2. **Quality control** with DNA filtering
+3. **Transformation** using arcsinh
+4. **Dimensionality reduction** (t-SNE and UMAP)
+5. **Clustering** using FlowSOM
+6. **Visualization** of clusters and markers
+7. **Cluster characterization** with heatmaps
+8. **Export** of results
+
+Adjust marker names, filtering thresholds, and clustering parameters based on your specific panel and data!

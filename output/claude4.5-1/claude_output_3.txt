@@ -1,0 +1,377 @@
+# CyTOF Analysis Pipeline for Single File
+
+Here's a comprehensive pipeline for analyzing a single CyTOF file in R:
+
+## 1. Setup and Dependencies
+
+```r
+# Install required packages (run once)
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c("flowCore", "CATALYST", "SingleCellExperiment"))
+install.packages(c("Rtsne", "umap", "ggplot2", "FlowSOM", "ConsensusClusterPlus",
+                   "pheatmap", "RColorBrewer", "gridExtra", "cowplot"))
+
+# Load libraries
+library(flowCore)
+library(CATALYST)
+library(SingleCellExperiment)
+library(FlowSOM)
+library(Rtsne)
+library(umap)
+library(ggplot2)
+library(pheatmap)
+library(dplyr)
+library(tidyr)
+```
+
+## 2. Load and Preprocess Data
+
+```r
+# Read FCS file
+fcs_file <- "path/to/your/file.fcs"
+fcs_data <- read.FCS(fcs_file, transformation = FALSE)
+
+# Extract expression matrix
+expr_matrix <- exprs(fcs_data)
+
+# Get marker names
+marker_names <- colnames(expr_matrix)
+print(paste("Total markers:", length(marker_names)))
+print(paste("Total cells:", nrow(expr_matrix)))
+```
+
+## 3. Quality Control
+
+```r
+# Function to identify and remove doublets based on DNA content
+remove_doublets <- function(fcs_data, dna_channels = c("DNA1", "DNA2")) {
+    expr <- exprs(fcs_data)
+    
+    # Identify DNA channels (adjust names as needed)
+    dna_cols <- grep("Ir191|Ir193|DNA", colnames(expr), ignore.case = TRUE)
+    
+    if (length(dna_cols) > 0) {
+        dna1 <- expr[, dna_cols[1]]
+        
+        # Remove cells with extreme DNA values (doublets/debris)
+        dna_threshold_low <- quantile(dna1, 0.01)
+        dna_threshold_high <- quantile(dna1, 0.99)
+        
+        keep_cells <- dna1 > dna_threshold_low & dna1 < dna_threshold_high
+        
+        fcs_data <- fcs_data[keep_cells, ]
+        print(paste("Cells after doublet removal:", nrow(exprs(fcs_data))))
+    }
+    
+    return(fcs_data)
+}
+
+# Remove doublets and debris
+fcs_data <- remove_doublets(fcs_data)
+
+# Remove beads (if bead channels present)
+remove_beads <- function(fcs_data) {
+    expr <- exprs(fcs_data)
+    bead_cols <- grep("Bead|Ce140|EQ", colnames(expr), ignore.case = TRUE)
+    
+    if (length(bead_cols) > 0) {
+        bead_signal <- expr[, bead_cols[1]]
+        keep_cells <- bead_signal < quantile(bead_signal, 0.95)
+        fcs_data <- fcs_data[keep_cells, ]
+        print(paste("Cells after bead removal:", nrow(exprs(fcs_data))))
+    }
+    
+    return(fcs_data)
+}
+
+fcs_data <- remove_beads(fcs_data)
+```
+
+## 4. Transformation
+
+```r
+# Arcsinh transformation (standard for CyTOF)
+cofactor <- 5  # Typical cofactor for CyTOF data
+
+transform_cytof <- function(fcs_data, cofactor = 5) {
+    expr <- exprs(fcs_data)
+    expr_transformed <- asinh(expr / cofactor)
+    exprs(fcs_data) <- expr_transformed
+    return(fcs_data)
+}
+
+fcs_transformed <- transform_cytof(fcs_data, cofactor = 5)
+
+# Extract transformed expression
+expr_transformed <- exprs(fcs_transformed)
+```
+
+## 5. Select Lineage and Functional Markers
+
+```r
+# Define marker panels (adjust based on your panel)
+# Exclude DNA, bead, and dead cell markers
+
+all_markers <- colnames(expr_transformed)
+
+# Identify markers to exclude
+exclude_patterns <- c("DNA", "Ir191", "Ir193", "Bead", "Ce140", 
+                      "Time", "Event", "Length", "Cisplatin", "Live")
+
+lineage_markers <- all_markers[!grepl(paste(exclude_patterns, collapse = "|"), 
+                                      all_markers, ignore.case = TRUE)]
+
+print("Selected markers:")
+print(lineage_markers)
+
+# Subset data
+expr_analysis <- expr_transformed[, lineage_markers]
+```
+
+## 6. Dimensionality Reduction
+
+```r
+# Set seed for reproducibility
+set.seed(42)
+
+# Subsample if dataset is large (>100,000 cells)
+max_cells_for_dr <- 50000
+if (nrow(expr_analysis) > max_cells_for_dr) {
+    sample_idx <- sample(1:nrow(expr_analysis), max_cells_for_dr)
+    expr_dr <- expr_analysis[sample_idx, ]
+} else {
+    expr_dr <- expr_analysis
+    sample_idx <- 1:nrow(expr_analysis)
+}
+
+# t-SNE
+cat("Running t-SNE...\n")
+tsne_result <- Rtsne(expr_dr, 
+                     dims = 2, 
+                     perplexity = 30, 
+                     verbose = TRUE,
+                     max_iter = 1000)
+
+tsne_coords <- as.data.frame(tsne_result$Y)
+colnames(tsne_coords) <- c("tSNE1", "tSNE2")
+
+# UMAP
+cat("Running UMAP...\n")
+umap_config <- umap.defaults
+umap_config$n_neighbors <- 15
+umap_config$min_dist <- 0.1
+
+umap_result <- umap(expr_dr, config = umap_config)
+umap_coords <- as.data.frame(umap_result$layout)
+colnames(umap_coords) <- c("UMAP1", "UMAP2")
+
+# Visualize
+p1 <- ggplot(tsne_coords, aes(x = tSNE1, y = tSNE2)) +
+    geom_point(size = 0.5, alpha = 0.5) +
+    theme_minimal() +
+    ggtitle("t-SNE Projection")
+
+p2 <- ggplot(umap_coords, aes(x = UMAP1, y = UMAP2)) +
+    geom_point(size = 0.5, alpha = 0.5) +
+    theme_minimal() +
+    ggtitle("UMAP Projection")
+
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+```
+
+## 7. Clustering with FlowSOM
+
+```r
+# FlowSOM clustering
+cat("Running FlowSOM clustering...\n")
+
+# Create FlowSOM object
+fsom <- FlowSOM(expr_analysis,
+                compensate = FALSE,
+                transform = FALSE,  # Already transformed
+                scale = TRUE,
+                colsToUse = 1:ncol(expr_analysis),
+                nClus = 20,  # Number of metaclusters
+                seed = 42)
+
+# Extract cluster assignments
+clusters <- GetMetaclusters(fsom)
+
+# Add clusters to dimensionality reduction data
+if (nrow(expr_analysis) > max_cells_for_dr) {
+    tsne_coords$Cluster <- factor(clusters[sample_idx])
+    umap_coords$Cluster <- factor(clusters[sample_idx])
+} else {
+    tsne_coords$Cluster <- factor(clusters)
+    umap_coords$Cluster <- factor(clusters)
+}
+
+# Visualize clusters
+p3 <- ggplot(tsne_coords, aes(x = tSNE1, y = tSNE2, color = Cluster)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    theme_minimal() +
+    scale_color_manual(values = rainbow(length(unique(clusters)))) +
+    ggtitle("t-SNE with FlowSOM Clusters")
+
+p4 <- ggplot(umap_coords, aes(x = UMAP1, y = UMAP2, color = Cluster)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    theme_minimal() +
+    scale_color_manual(values = rainbow(length(unique(clusters)))) +
+    ggtitle("UMAP with FlowSOM Clusters")
+
+gridExtra::grid.arrange(p3, p4, ncol = 2)
+```
+
+## 8. Cluster Characterization
+
+```r
+# Calculate median marker expression per cluster
+cluster_medians <- t(sapply(sort(unique(clusters)), function(cl) {
+    apply(expr_analysis[clusters == cl, ], 2, median)
+}))
+
+rownames(cluster_medians) <- paste0("Cluster_", sort(unique(clusters)))
+
+# Create heatmap
+pheatmap(cluster_medians,
+         scale = "column",
+         clustering_distance_rows = "euclidean",
+         clustering_distance_cols = "euclidean",
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         main = "Median Marker Expression per Cluster",
+         fontsize = 8)
+
+# Cluster sizes
+cluster_sizes <- table(clusters)
+barplot(cluster_sizes, 
+        main = "Cluster Sizes",
+        xlab = "Cluster",
+        ylab = "Number of Cells",
+        col = rainbow(length(cluster_sizes)))
+```
+
+## 9. Marker Expression Visualization
+
+```r
+# Plot marker expression on dimensionality reduction
+plot_marker_expression <- function(coords, expr_data, marker_name, 
+                                   reduction = "tSNE") {
+    plot_df <- coords
+    plot_df$Expression <- expr_data[sample_idx, marker_name]
+    
+    ggplot(plot_df, aes_string(x = colnames(coords)[1], 
+                               y = colnames(coords)[2], 
+                               color = "Expression")) +
+        geom_point(size = 0.5, alpha = 0.6) +
+        scale_color_gradient2(low = "blue", mid = "gray90", high = "red",
+                             midpoint = median(plot_df$Expression)) +
+        theme_minimal() +
+        ggtitle(paste(marker_name, "Expression -", reduction))
+}
+
+# Example: Plot first 4 markers
+marker_plots <- lapply(lineage_markers[1:4], function(m) {
+    plot_marker_expression(tsne_coords[, 1:2], expr_analysis, m, "tSNE")
+})
+
+do.call(gridExtra::grid.arrange, c(marker_plots, ncol = 2))
+```
+
+## 10. Export Results
+
+```r
+# Create results directory
+dir.create("cytof_results", showWarnings = FALSE)
+
+# Save processed data
+write.csv(expr_analysis, "cytof_results/transformed_expression.csv")
+write.csv(tsne_coords, "cytof_results/tsne_coordinates.csv")
+write.csv(umap_coords, "cytof_results/umap_coordinates.csv")
+write.csv(cluster_medians, "cytof_results/cluster_medians.csv")
+
+# Save cluster assignments
+cluster_df <- data.frame(
+    CellID = 1:length(clusters),
+    Cluster = clusters
+)
+write.csv(cluster_df, "cytof_results/cluster_assignments.csv", row.names = FALSE)
+
+# Save plots
+pdf("cytof_results/analysis_plots.pdf", width = 12, height = 8)
+gridExtra::grid.arrange(p1, p2, ncol = 2)
+gridExtra::grid.arrange(p3, p4, ncol = 2)
+pheatmap(cluster_medians, scale = "column")
+dev.off()
+
+cat("Analysis complete! Results saved in 'cytof_results' directory.\n")
+```
+
+## Complete Wrapper Function
+
+```r
+# All-in-one function
+analyze_cytof_file <- function(fcs_file, output_dir = "cytof_results", 
+                               n_clusters = 20, cofactor = 5) {
+    
+    # Create output directory
+    dir.create(output_dir, showWarnings = FALSE)
+    
+    # Load data
+    cat("Loading data...\n")
+    fcs_data <- read.FCS(fcs_file, transformation = FALSE)
+    
+    # QC
+    cat("Quality control...\n")
+    fcs_data <- remove_doublets(fcs_data)
+    fcs_data <- remove_beads(fcs_data)
+    
+    # Transform
+    cat("Transforming data...\n")
+    fcs_transformed <- transform_cytof(fcs_data, cofactor)
+    expr_transformed <- exprs(fcs_transformed)
+    
+    # Select markers
+    all_markers <- colnames(expr_transformed)
+    exclude_patterns <- c("DNA", "Ir191", "Ir193", "Bead", "Ce140", 
+                          "Time", "Event", "Length", "Cisplatin")
+    lineage_markers <- all_markers[!grepl(paste(exclude_patterns, collapse = "|"), 
+                                          all_markers, ignore.case = TRUE)]
+    expr_analysis <- expr_transformed[, lineage_markers]
+    
+    # Clustering
+    cat("Clustering...\n")
+    fsom <- FlowSOM(expr_analysis, nClus = n_clusters, seed = 42)
+    clusters <- GetMetaclusters(fsom)
+    
+    # Dimensionality reduction
+    cat("Dimensionality reduction...\n")
+    set.seed(42)
+    max_cells <- min(50000, nrow(expr_analysis))
+    sample_idx <- sample(1:nrow(expr_analysis), max_cells)
+    
+    tsne_result <- Rtsne(expr_analysis[sample_idx, ], dims = 2, perplexity = 30)
+    umap_result <- umap(expr_analysis[sample_idx, ])
+    
+    # Save results
+    cat("Saving results...\n")
+    results <- list(
+        expression = expr_analysis,
+        clusters = clusters,
+        tsne = tsne_result$Y,
+        umap = umap_result$layout,
+        markers = lineage_markers
+    )
+    
+    saveRDS(results, file.path(output_dir, "cytof_results.rds"))
+    
+    cat("Analysis complete!\n")
+    return(results)
+}
+
+# Run analysis
+# results <- analyze_cytof_file("your_file.fcs")
+```
+
+This pipeline provides a complete workflow for analyzing a single CyTOF file, including QC, transformation, clustering, dimensionality reduction, and visualization.

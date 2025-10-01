@@ -1,0 +1,351 @@
+# CyTOF Analysis Pipeline for Single File
+
+Here's a comprehensive pipeline for analyzing a single CyTOF (Mass Cytometry) data file in R:
+
+```r
+# ==============================================================================
+# CyTOF Single File Analysis Pipeline
+# ==============================================================================
+
+# Install required packages (run once)
+# ------------------------------------------------------------------------------
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+packages <- c("flowCore", "CATALYST", "SingleCellExperiment", 
+              "ggplot2", "ComplexHeatmap", "FlowSOM", "Rtsne", "uwot")
+              
+for (pkg in packages) {
+    if (!require(pkg, character.only = TRUE)) {
+        BiocManager::install(pkg)
+    }
+}
+
+# Load libraries
+# ------------------------------------------------------------------------------
+library(flowCore)
+library(CATALYST)
+library(SingleCellExperiment)
+library(ggplot2)
+library(ComplexHeatmap)
+library(FlowSOM)
+library(uwot)
+library(dplyr)
+
+# ==============================================================================
+# 1. DATA IMPORT
+# ==============================================================================
+
+# Read FCS file
+fcs_file <- "path/to/your/file.fcs"
+ff <- read.FCS(fcs_file, transformation = FALSE)
+
+cat("Data dimensions:", dim(ff), "\n")
+cat("Number of cells:", nrow(ff), "\n")
+cat("Number of parameters:", ncol(ff), "\n")
+
+# View parameter names
+params <- parameters(ff)$desc
+print(data.frame(Channel = colnames(ff), Marker = params))
+
+# ==============================================================================
+# 2. DEFINE PANEL INFORMATION
+# ==============================================================================
+
+# Create a panel data frame (customize based on your panel)
+# Format: fcs_colname, antigen, marker_class
+panel <- data.frame(
+    fcs_colname = colnames(ff)[8:45],  # Adjust indices for your data
+    antigen = c("CD45", "CD3", "CD4", "CD8", "CD19", "CD20", 
+                "CD14", "CD16", "CD56", "CD11c", "HLA-DR",
+                # Add all your markers here
+                "..."),
+    marker_class = c(rep("type", 11),  # Lineage markers
+                     rep("state", 10),  # Functional markers
+                     rep("none", 7))    # Non-markers (DNA, viability, etc.)
+)
+
+# ==============================================================================
+# 3. DATA PREPROCESSING
+# ==============================================================================
+
+# Create SingleCellExperiment object
+sce <- prepData(ff, panel = panel, 
+                md = NULL,  # No metadata for single file
+                transform = TRUE,  # Apply arcsinh transformation
+                cofactor = 5)  # Standard cofactor for CyTOF
+
+cat("SCE object created with", ncol(sce), "cells\n")
+
+# ==============================================================================
+# 4. QUALITY CONTROL
+# ==============================================================================
+
+# Plot signal intensity distributions
+plotExprs(sce, color_by = "marker_class")
+
+# Check DNA content (for doublet detection)
+dna_channels <- grep("DNA|Ir191|Ir193", rownames(sce), value = TRUE)
+if (length(dna_channels) > 0) {
+    plotExprs(sce, features = dna_channels[1])
+}
+
+# Bead removal (if beads are present)
+# Identify beads based on characteristic bead channels
+bead_channels <- grep("Bead|Ce140|Eu151|Eu153|Ho165|Lu175", 
+                      rownames(sce), value = TRUE)
+
+if (length(bead_channels) > 0) {
+    bead_gates <- colSums(assay(sce, "exprs")[bead_channels, , drop = FALSE]) < 
+                  quantile(colSums(assay(sce, "exprs")[bead_channels, , drop = FALSE]), 0.95)
+    sce <- sce[, bead_gates]
+    cat("After bead removal:", ncol(sce), "cells\n")
+}
+
+# Remove dead cells (if viability marker present)
+viability_channel <- grep("Viability|Live|Dead|Cisplatin", 
+                          rownames(sce), value = TRUE)
+if (length(viability_channel) > 0) {
+    live_gate <- assay(sce, "exprs")[viability_channel[1], ] < 
+                 quantile(assay(sce, "exprs")[viability_channel[1], ], 0.90)
+    sce <- sce[, live_gate]
+    cat("After viability filtering:", ncol(sce), "cells\n")
+}
+
+# ==============================================================================
+# 5. DIMENSIONALITY REDUCTION
+# ==============================================================================
+
+# Select type markers for clustering
+type_markers <- rowData(sce)$marker_class == "type"
+
+# Run UMAP
+set.seed(123)
+sce <- runDR(sce, dr = "UMAP", cells = 5000, features = type_markers)
+
+# Run t-SNE (optional)
+set.seed(123)
+sce <- runDR(sce, dr = "TSNE", cells = 5000, features = type_markers)
+
+# Plot UMAP
+plotDR(sce, dr = "UMAP", color_by = "CD45")
+
+# ==============================================================================
+# 6. CLUSTERING WITH FLOWSOM
+# ==============================================================================
+
+# Run FlowSOM clustering
+set.seed(123)
+sce <- cluster(sce, 
+               features = type_markers,
+               xdim = 10, ydim = 10,  # SOM grid size
+               maxK = 20,              # Number of metaclusters
+               seed = 123)
+
+# Plot clusters on UMAP
+plotDR(sce, dr = "UMAP", color_by = "meta20")
+
+# Plot cluster heatmap
+plotExprHeatmap(sce, 
+                features = type_markers,
+                by = "cluster_id",
+                k = "meta20",
+                bars = TRUE,
+                perc = TRUE)
+
+# ==============================================================================
+# 7. CLUSTER ABUNDANCE
+# ==============================================================================
+
+# Calculate cluster frequencies
+cluster_freq <- table(cluster_ids(sce, "meta20"))
+cluster_freq_pct <- prop.table(cluster_freq) * 100
+
+freq_df <- data.frame(
+    Cluster = names(cluster_freq),
+    Count = as.numeric(cluster_freq),
+    Percentage = as.numeric(cluster_freq_pct)
+)
+
+print(freq_df)
+
+# Plot cluster abundances
+ggplot(freq_df, aes(x = reorder(Cluster, -Percentage), y = Percentage)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    theme_minimal() +
+    labs(title = "Cluster Abundance",
+         x = "Cluster",
+         y = "Percentage of cells") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# ==============================================================================
+# 8. MARKER EXPRESSION ANALYSIS
+# ==============================================================================
+
+# Heatmap of median marker expression by cluster
+plotExprHeatmap(sce, 
+                features = "type",
+                by = "cluster_id",
+                k = "meta20",
+                scale = "last",
+                bars = TRUE)
+
+# Heatmap including state markers
+plotExprHeatmap(sce, 
+                features = c("type", "state"),
+                by = "cluster_id",
+                k = "meta20",
+                scale = "last",
+                bars = TRUE)
+
+# Expression distributions by cluster
+plotClusterExprs(sce, k = "meta20", features = "type")
+
+# ==============================================================================
+# 9. MANUAL CLUSTER ANNOTATION
+# ==============================================================================
+
+# Create annotation based on marker expression
+# Examine the heatmap and assign cell types
+cluster_annotation <- data.frame(
+    cluster_id = 1:20,
+    cell_type = c(
+        "CD4 T cells",
+        "CD8 T cells",
+        "B cells",
+        "NK cells",
+        "Monocytes",
+        # Add annotations for all clusters
+        "..."
+    )
+)
+
+# Merge annotations
+metadata(sce)$cluster_codes <- cluster_annotation
+
+# Plot annotated UMAP
+plotDR(sce, dr = "UMAP", color_by = "meta20") +
+    scale_color_manual(values = rainbow(20),
+                       labels = cluster_annotation$cell_type)
+
+# ==============================================================================
+# 10. SAVE RESULTS
+# ==============================================================================
+
+# Create output directory
+dir.create("cytof_analysis_output", showWarnings = FALSE)
+
+# Save SCE object
+saveRDS(sce, "cytof_analysis_output/sce_processed.rds")
+
+# Export cluster assignments
+cluster_assignments <- data.frame(
+    cell_id = colnames(sce),
+    cluster_id = cluster_ids(sce, "meta20")
+)
+write.csv(cluster_assignments, 
+          "cytof_analysis_output/cluster_assignments.csv",
+          row.names = FALSE)
+
+# Export cluster statistics
+write.csv(freq_df, 
+          "cytof_analysis_output/cluster_frequencies.csv",
+          row.names = FALSE)
+
+# Save plots
+pdf("cytof_analysis_output/analysis_plots.pdf", width = 10, height = 8)
+
+# UMAP colored by clusters
+print(plotDR(sce, dr = "UMAP", color_by = "meta20"))
+
+# Expression heatmap
+print(plotExprHeatmap(sce, 
+                      features = "type",
+                      by = "cluster_id",
+                      k = "meta20",
+                      bars = TRUE))
+
+# Marker expressions
+for (marker in rownames(sce)[type_markers]) {
+    print(plotDR(sce, dr = "UMAP", color_by = marker))
+}
+
+dev.off()
+
+cat("\nAnalysis complete! Results saved to 'cytof_analysis_output/'\n")
+
+# ==============================================================================
+# 11. ADDITIONAL ANALYSES (OPTIONAL)
+# ==============================================================================
+
+# Pseudotime analysis (if trajectory expected)
+# Differential abundance testing (requires multiple samples)
+# Differential state analysis (requires conditions)
+
+# Example: Extract cells from specific cluster for further analysis
+cd4_cells <- sce[, cluster_ids(sce, "meta20") == "1"]  # Assuming cluster 1 is CD4 T cells
+
+# Subset state marker expression
+state_markers <- rowData(sce)$marker_class == "state"
+cd4_state_expression <- assay(cd4_cells, "exprs")[state_markers, ]
+
+# Statistical summary
+summary_stats <- data.frame(
+    Marker = rownames(cd4_state_expression),
+    Mean = rowMeans(cd4_state_expression),
+    Median = apply(cd4_state_expression, 1, median),
+    SD = apply(cd4_state_expression, 1, sd)
+)
+print(summary_stats)
+```
+
+## Alternative: Simplified Pipeline without CATALYST
+
+```r
+# ==============================================================================
+# Simplified CyTOF Pipeline (using flowCore and FlowSOM only)
+# ==============================================================================
+
+library(flowCore)
+library(FlowSOM)
+library(Rtsne)
+library(ggplot2)
+
+# Read data
+ff <- read.FCS("path/to/file.fcs", transformation = FALSE)
+
+# Apply arcsinh transformation
+markers_to_use <- 8:45  # Adjust based on your panel
+data_matrix <- exprs(ff)[, markers_to_use]
+data_transformed <- asinh(data_matrix / 5)
+
+# Run FlowSOM
+fsom <- FlowSOM(ff,
+                colsToUse = markers_to_use,
+                nClus = 20,
+                seed = 123)
+
+# Get cluster assignments
+clusters <- GetMetaclusters(fsom)
+
+# Run t-SNE
+set.seed(123)
+tsne_result <- Rtsne(data_transformed[sample(nrow(data_transformed), 10000), ],
+                     dims = 2,
+                     perplexity = 30,
+                     verbose = TRUE)
+
+# Plot
+tsne_df <- data.frame(
+    tSNE1 = tsne_result$Y[, 1],
+    tSNE2 = tsne_result$Y[, 2],
+    Cluster = as.factor(clusters[sample(nrow(data_transformed), 10000)])
+)
+
+ggplot(tsne_df, aes(x = tSNE1, y = tSNE2, color = Cluster)) +
+    geom_point(size = 0.5, alpha = 0.5) +
+    theme_minimal() +
+    labs(title = "t-SNE visualization of CyTOF clusters")
+```
+
+This pipeline provides a complete workflow for analyzing a single CyTOF file, from data import through clustering and visualization. Adjust the marker names, channels, and parameters based on your specific panel and experimental design.

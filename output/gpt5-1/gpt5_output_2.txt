@@ -1,0 +1,240 @@
+Below is a concise, end‑to‑end R pipeline to analyze a single CyTOF FCS file. It performs basic QC (bead/debris/dead/doublet removal), arcsinh transform, clustering (FlowSOM+meta), UMAP, and exports results. It uses robust defaults and simple auto-detection heuristics, but you should review channel names and thresholds for your panel.
+
+High-level steps
+- Load dependencies and the FCS file
+- Auto-detect special channels (DNA, viability, beads, length/time)
+- QC gating: remove beads, debris (low DNA), dead cells (high cisplatin), doublets (event length)
+- Transform with arcsinh (cofactor 5)
+- Select type markers for clustering
+- Cluster with FlowSOM + meta-clustering and run UMAP
+- Export event-level cluster labels and embeddings, and cluster medians
+
+R script (copy-paste into an R session or file)
+----------------
+# ========= User inputs =========
+fcs_file <- "path/to/your_file.fcs"    # Single FCS file
+out_dir  <- "cytof_onefile_output"     # Output directory
+set.seed(1234)
+
+# Choose an expected number of metaclusters for annotation; adjust as needed
+meta_k <- 15
+
+# ========= Install/load packages =========
+pkgs <- c(
+  "flowCore", "CATALYST", "SummarizedExperiment", "SingleCellExperiment",
+  "FlowSOM", "ConsensusClusterPlus", "scater", "ggplot2", "dplyr", "stringr"
+)
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install)) {
+  if (!"BiocManager" %in% rownames(installed.packages())) install.packages("BiocManager")
+  BiocManager::install(to_install, ask = FALSE, update = FALSE)
+}
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# ========= Helper functions =========
+# Find a 1D density valley threshold between two modes; fallback to quantiles if unimodal
+find_valley_threshold <- function(x, fallback_quant = 0.95, prefer = c("low","high")) {
+  x <- x[is.finite(x)]
+  if (length(unique(x)) < 10) return(unname(quantile(x, fallback_quant, na.rm=TRUE)))
+  d <- density(x, bw = "nrd0", n = 512)
+  y <- d$y; xx <- d$x
+  # local maxima/minima
+  dy <- diff(y)
+  peaks   <- which(diff(sign(dy)) == -2) + 1
+  valleys <- which(diff(sign(dy)) ==  2) + 1
+  if (length(peaks) >= 2 && length(valleys) >= 1) {
+    # choose the valley closest to the midpoint between the two largest peaks
+    top2 <- head(peaks[order(y[peaks], decreasing = TRUE)], 2)
+    midx <- mean(xx[top2])
+    thr <- xx[valleys[which.min(abs(xx[valleys] - midx))]]
+    return(thr)
+  } else {
+    # fallback
+    prefer <- match.arg(prefer)
+    if (prefer == "low")  return(unname(quantile(x, 0.05, na.rm=TRUE)))
+    if (prefer == "high") return(unname(quantile(x, 0.95, na.rm=TRUE)))
+  }
+}
+
+# Clean channel/antigen names to ease matching
+.clean <- function(x) tolower(gsub("[^[:alnum:]]+", "", x))
+
+# ========= Read FCS and build panel metadata =========
+ff <- flowCore::read.FCS(fcs_file, transformation = FALSE, truncate_max_range = FALSE)
+params <- flowCore::pData(flowCore::parameters(ff))
+fcs_colname <- params$name
+antigen <- params$desc
+antigen[is.na(antigen) | antigen == ""] <- fcs_colname[is.na(antigen) | antigen == ""]
+
+# Heuristic channel classes: "type" (for clustering), "state" (functional), "none" (non-informative)
+desc_clean <- .clean(antigen)
+name_clean <- .clean(fcs_colname)
+is_special <- function(x, patterns) {
+  sapply(x, function(xx) any(stringr::str_detect(xx, stringr::regex(paste(patterns, collapse="|"), ignore_case=TRUE))))
+}
+
+none_patterns  <- c("time","length","eventlength","center","offset","width","residual","bead","ce140","140ce",
+                    "eq","barcod","pd[0-9]*","191ir","193ir","ir191","ir193","dna","cisplatin","pt195","dead","viab")
+state_patterns <- c("^p[[:alnum:]]", "phospho", "stat", "erk", "akt", "nfkb", "s6", "mapk", "sirp", "ifn", "tnf")
+
+class <- rep("type", length(fcs_colname))
+class[is_special(desc_clean, none_patterns) | is_special(name_clean, none_patterns)] <- "none"
+class[is_special(desc_clean, state_patterns)] <- "state"
+
+panel <- data.frame(
+  fcs_colname = fcs_colname,
+  antigen = antigen,
+  marker_class = class,
+  stringsAsFactors = FALSE
+)
+
+# Minimal md (metadata) for one sample
+md <- data.frame(
+  file_name = basename(fcs_file),
+  sample_id = tools::file_path_sans_ext(basename(fcs_file)),
+  condition = "sample",
+  stringsAsFactors = FALSE
+)
+
+# ========= Prepare SingleCellExperiment with arcsinh transform =========
+sce <- CATALYST::prepData(
+  x = fcs_file,
+  panel = panel,
+  md = md,
+  transform = TRUE,
+  cofactor = 5
+)
+
+# ========= Identify special channels (best-effort heuristics; review/override if needed) =========
+# DNA channels (Ir191/Ir193)
+dna_idx <- which(class == "none" & (is_special(desc_clean, c("191ir","193ir","dna")) | is_special(name_clean, c("191ir","193ir","dna"))))
+# Viability (cisplatin/Pt195)
+viab_idx <- which(class == "none" & (is_special(desc_clean, c("cisplatin","pt195","195pt","viab","dead")) | is_special(name_clean, c("cisplatin","pt195","195pt","viab","dead"))))
+# Beads (Ce140/EQ)
+bead_idx <- which(class == "none" & (is_special(desc_clean, c("ce140","140ce","bead","eq")) | is_special(name_clean, c("ce140","140ce","bead","eq"))))
+# Event length
+len_idx <- which(class == "none" & (is_special(desc_clean, c("eventlength","length")) | is_special(name_clean, c("eventlength","length"))))
+
+dna_ch   <- if (length(dna_idx)) panel$fcs_colname[dna_idx] else NA
+viab_ch  <- if (length(viab_idx)) panel$fcs_colname[viab_idx][1] else NA
+bead_ch  <- if (length(bead_idx)) panel$fcs_colname[bead_idx][1] else NA
+length_ch<- if (length(len_idx))  panel$fcs_colname[len_idx][1]  else NA
+
+message("Detected channels:")
+message(sprintf("  DNA: %s", paste(na.omit(dna_ch), collapse=", ")))
+message(sprintf("  Viability: %s", ifelse(is.na(viab_ch), "NA", viab_ch)))
+message(sprintf("  Beads: %s", ifelse(is.na(bead_ch), "NA", bead_ch)))
+message(sprintf("  Event length: %s", ifelse(is.na(length_ch), "NA", length_ch)))
+
+# ========= QC gating on arcsinh-transformed data =========
+exprs <- SummarizedExperiment::assay(sce, "exprs")
+
+keep <- rep(TRUE, ncol(sce))
+
+# 1) Remove beads (high Ce/EQ)
+if (!is.na(bead_ch)) {
+  x <- exprs[bead_ch, ]
+  thr <- find_valley_threshold(x, fallback_quant = 0.99, prefer = "high")
+  keep <- keep & (x < thr)
+}
+
+# 2) Keep DNA+ (exclude debris/empty) using max of DNA channels if two present
+if (length(dna_ch) >= 1) {
+  dna_signal <- apply(exprs[dna_ch, , drop=FALSE], 2, max)
+  thr <- find_valley_threshold(dna_signal, fallback_quant = 0.05, prefer = "low")
+  keep <- keep & (dna_signal > thr)
+}
+
+# 3) Remove dead (high cisplatin/Pt195)
+if (!is.na(viab_ch)) {
+  x <- exprs[viab_ch, ]
+  thr <- find_valley_threshold(x, fallback_quant = 0.95, prefer = "high")
+  keep <- keep & (x < thr)
+}
+
+# 4) Remove doublets by event length (keep main mode)
+if (!is.na(length_ch)) {
+  x <- exprs[length_ch, ]
+  # Gate out extreme high tail; optionally gate out extreme low tail
+  high_thr <- find_valley_threshold(x, fallback_quant = 0.99, prefer = "high")
+  low_thr  <- unname(quantile(x, 0.01, na.rm = TRUE))
+  keep <- keep & (x > low_thr & x < high_thr)
+}
+
+sce <- sce[, keep, drop = FALSE]
+message(sprintf("Kept %d / %d events after QC", ncol(sce), length(keep)))
+
+# ========= Select clustering markers (type markers only) =========
+type_markers <- panel$fcs_colname[panel$marker_class == "type"]
+# Drop any markers with zero variance post-QC
+mvars <- matrixStats::rowVars(SummarizedExperiment::assay(sce, "exprs")[type_markers, , drop=FALSE])
+type_markers <- type_markers[mvars > 0]
+stopifnot(length(type_markers) > 0)
+
+# ========= Clustering (FlowSOM + consensus meta-clustering) =========
+sce <- CATALYST::cluster(
+  sce,
+  features = type_markers,
+  xdim = 10, ydim = 10, maxK = max(20, meta_k),
+  seed = 1234
+)
+
+# Choose meta_k and store as cluster_id
+sce <- CATALYST::mergeClusters(sce, k = meta_k, prefix = "meta")
+# Resulting labels stored in colData(sce)$cluster_id
+table(colData(sce)$cluster_id)
+
+# ========= Dimensionality reduction (UMAP) =========
+sce <- CATALYST::runDR(
+  sce, dr = "UMAP", features = type_markers, cells = NULL, seed = 1234
+)
+
+# ========= Export results =========
+# Event-level data: UMAP, cluster, selected markers
+dr <- SingleCellExperiment::reducedDim(sce, "UMAP")
+ev <- data.frame(
+  cell_id = seq_len(ncol(sce)),
+  cluster = colData(sce)$cluster_id,
+  UMAP1 = dr[,1],
+  UMAP2 = dr[,2],
+  t(SummarizedExperiment::assay(sce, "exprs")[type_markers, , drop=FALSE]),
+  check.names = FALSE
+)
+write.csv(ev, file = file.path(out_dir, "events_umap_clusters.csv"), row.names = FALSE)
+
+# Cluster medians for all markers
+m_medians <- CATALYST::plotClusterHeatmap(
+  sce, k = sprintf("meta%s", meta_k), draw_freqs = FALSE, draw_medians = TRUE,
+  hm2 = FALSE, scale = TRUE, q = 0.01, cluster_ann = FALSE, fun = "median",
+  bars = FALSE, draw = FALSE
+)$median # returns a matrix invisibly when draw=FALSE
+
+write.csv(m_medians, file = file.path(out_dir, "cluster_medians.csv"))
+
+# Save a couple of quick plots
+p1 <- CATALYST::plotDR(sce, "UMAP", color_by = "cluster_id", facet_by = NULL) +
+  ggplot2::ggtitle(sprintf("UMAP (meta_k = %d)", meta_k))
+ggplot2::ggsave(file.path(out_dir, "umap_by_cluster.png"), p1, width = 6, height = 5, dpi = 200)
+
+p2 <- CATALYST::plotClusterHeatmap(
+  sce, k = sprintf("meta%s", meta_k), draw_freqs = FALSE, draw_medians = TRUE,
+  hm2 = FALSE, scale = TRUE, q = 0.01, cluster_ann = FALSE, fun = "median"
+)
+ggplot2::ggsave(file.path(out_dir, "cluster_median_heatmap.png"), p2, width = 7, height = 6, dpi = 200)
+
+# Save SCE object for downstream use
+saveRDS(sce, file.path(out_dir, "sce_after_clustering.rds"))
+
+message("Done. Outputs written to: ", normalizePath(out_dir))
+
+Notes and tips
+- Verify channel detection: Update the patterns for DNA (Ir191/Ir193), viability (cisplatin/Pt195), beads (Ce140/EQ), and event length if your instrument uses different names.
+- Bead normalization: Prefer doing this in acquisition software (e.g., Fluidigm bead normalization). This script assumes data are already normalized. If not, normalize first.
+- Thresholds: The automatic thresholds work in many cases, but manual review is recommended. You can replace find_valley_threshold with manual cutoffs if needed.
+- Marker classes: Heuristics set “type” markers for clustering. If you have a curated panel sheet, replace the auto-generated panel with your panel CSV (fcs_colname, antigen, marker_class).
+- meta_k: Adjust to your biology and panel complexity; commonly 10–30 for whole blood/immune panels.
+- Differential testing: With only one file you cannot do DA/DS statistics; with groups, use diffcyt or CATALYST testing utilities.
+
+If you prefer Python, I can provide a light-weight pipeline using FlowKit/scanpy for arcsinh, QC, UMAP, and Phenograph, but R/ Bioconductor remains the most mature stack for CyTOF.

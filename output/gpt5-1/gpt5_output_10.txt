@@ -1,0 +1,193 @@
+Below is a complete, minimal, single-sample CyTOF pipeline you can run end-to-end in R. It reads one FCS file, performs basic QC/cleanup, arcsinh-transforms, reduces dimensionality (UMAP), clusters cells (FlowSOM + meta-clustering), generates quick QC/cluster plots, and exports per-cell and per-cluster outputs. The thresholds and marker selection are deliberately conservative and data-driven to work on a wide range of panels; you should tweak to match your experiment.
+
+High-level steps
+- Input: one .fcs file
+- QC/cleanup: remove normalization beads (Ce140), debris (low Ir191/Ir193), dead cells (Pt195 high), doublets (event length high), and acquisition anomalies (time extremes)
+- Transform: arcsinh with cofactor 5
+- Feature selection: exclude technical channels (Time, Event_length, beads, DNA, viability)
+- Dimensionality reduction: UMAP
+- Clustering: FlowSOM grid + consensus meta-clustering
+- Outputs: UMAP coordinates, cluster IDs, per-cluster marker medians, simple plots, CSVs
+
+R code (copy-paste and edit paths/parameters as needed)
+- Requirements: R >= 4.1; packages flowCore, FlowSOM, uwot, ggplot2, data.table, matrixStats, pheatmap
+
+# install.packages(c("flowCore","FlowSOM","uwot","ggplot2","data.table","matrixStats","pheatmap"))
+library(flowCore)
+library(FlowSOM)
+library(uwot)
+library(ggplot2)
+library(data.table)
+library(matrixStats)
+library(pheatmap)
+
+set.seed(12345)
+
+# 1) Input ---------------------------------------------------------------------
+fcs_path <- "path/to/your_file.fcs"   # <- EDIT
+outdir   <- "cytof_out_one_file"      # outputs will be written here
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+ff <- read.FCS(fcs_path, transformation = FALSE, truncate_max_range = FALSE)
+
+# Extract channel and marker names
+pd <- pData(parameters(ff))
+chan <- pd$name
+desc <- pd$desc
+marker <- ifelse(is.na(desc) | desc == "", chan, desc)
+
+# Build expression matrix (raw)
+X <- exprs(ff)
+colnames(X) <- marker
+
+# 2) arcsinh transform (cofactor 5) --------------------------------------------
+cofactor <- 5
+X_tr <- asinh(X / cofactor)
+
+# 3) Basic QC / cleanup --------------------------------------------------------
+# Heuristic channel detection by common names (adjust to your panel)
+get_col <- function(patterns) {
+  hits <- unique(unlist(lapply(patterns, function(p) grep(p, marker, ignore.case = TRUE, value = TRUE))))
+  hits
+}
+ch_time  <- get_col(c("^time$"))
+ch_evlen <- get_col(c("event[_ ]?length"))
+ch_bead  <- get_col(c("ce140", "bead"))
+ch_dna1  <- get_col(c("ir191", "dna1"))
+ch_dna2  <- get_col(c("ir193", "dna2"))
+ch_dead  <- get_col(c("pt195", "cisplatin", "viab"))
+
+# Build a keep mask stepwise; start with all TRUE
+keep <- rep(TRUE, nrow(X_tr))
+
+# 3a) Remove normalization beads (high Ce140)
+if (length(ch_bead) >= 1) {
+  b <- rowMaxs(as.matrix(X_tr[, ch_bead, drop = FALSE]))
+  thr <- quantile(b[is.finite(b)], 0.99)  # keep bottom 99%
+  keep <- keep & (b < thr)
+}
+
+# 3b) DNA/singlet gating (keep Ir191+Ir193 high, and near 1:1 ratio)
+if (length(ch_dna1) >= 1 & length(ch_dna2) >= 1) {
+  d1 <- X_tr[, ch_dna1[1]]
+  d2 <- X_tr[, ch_dna2[1]]
+  dsum <- d1 + d2
+  # Keep top 70% by DNA sum (remove debris)
+  thr_low <- quantile(dsum[is.finite(dsum)], 0.30)
+  # Keep reasonable ratio to remove doublets (broad heuristic)
+  ratio <- (d1 + 1e-6) / (d2 + 1e-6)
+  keep <- keep & (dsum > thr_low) & (ratio > 0.4) & (ratio < 2.5)
+}
+
+# 3c) Remove dead (high Pt195/cisplatin) if present
+if (length(ch_dead) >= 1) {
+  dead <- rowMaxs(as.matrix(X_tr[, ch_dead, drop = FALSE]))
+  thr_dead <- quantile(dead[is.finite(dead)], 0.95)  # keep bottom 95%
+  keep <- keep & (dead < thr_dead)
+}
+
+# 3d) Remove extreme event length (doublets) if available
+if (length(ch_evlen) >= 1) {
+  el <- rowMeans(as.matrix(X_tr[, ch_evlen, drop = FALSE]))
+  lo <- quantile(el[is.finite(el)], 0.02)
+  hi <- quantile(el[is.finite(el)], 0.98)
+  keep <- keep & (el >= lo & el <= hi)
+}
+
+# 3e) Remove acquisition anomalies on Time (optional, mild trimming)
+if (length(ch_time) >= 1) {
+  tm <- X_tr[, ch_time[1]]
+  lo <- quantile(tm[is.finite(tm)], 0.005)
+  hi <- quantile(tm[is.finite(tm)], 0.995)
+  keep <- keep & (tm >= lo & tm <= hi)
+}
+
+# Apply filter
+X_tr_f <- X_tr[keep, , drop = FALSE]
+cat(sprintf("Kept %d/%d events after QC\n", nrow(X_tr_f), nrow(X_tr)))
+
+# 4) Select analysis markers (exclude technical channels) ----------------------
+is_technical <- rep(FALSE, ncol(X_tr_f))
+tech_patterns <- c("^time$", "event[_ ]?length", "ce140", "bead", "ir191", "ir193", "pt195", "cisplatin",
+                   "center", "offset", "width", "residual", "file", "barcode")
+for (p in tech_patterns) {
+  is_technical <- is_technical | grepl(p, marker, ignore.case = TRUE)
+}
+features <- colnames(X_tr_f)[!is_technical]
+if (length(features) < 5) stop("Too few analysis markers detected. Please set features manually.")
+
+# 5) Dimensionality reduction (UMAP) ------------------------------------------
+set.seed(12345)
+umap_coords <- umap(X_tr_f[, features, drop = FALSE], n_neighbors = 15, min_dist = 0.2, metric = "euclidean")
+colnames(umap_coords) <- c("UMAP1", "UMAP2")
+
+# 6) Clustering (FlowSOM + meta-clustering) -----------------------------------
+# FlowSOM expects a flowFrame; use the transformed, filtered matrix with features only
+ff2 <- flowFrame(as.matrix(X_tr_f[, features, drop = FALSE]))
+fsom <- ReadInput(ff2, transform = FALSE, scale = TRUE)
+fsom <- BuildSOM(fsom, colsToUse = colnames(exprs(ff2)), xdim = 10, ydim = 10)  # 100 nodes
+fsom <- BuildMST(fsom)
+
+# Meta-cluster the codes into k clusters (adjust k)
+k_meta <- 20
+meta <- metaClustering_consensus(fsom$map$codes, k = k_meta)
+clusters <- meta[fsom$map$mapping[,1]]
+clusters <- factor(clusters, levels = sort(unique(clusters)))
+
+# 7) Summaries and exports -----------------------------------------------------
+# Per-cluster median expression heatmap
+med_by_cluster <- aggregate(X_tr_f[, features, drop = FALSE],
+                            by = list(cluster = clusters),
+                            FUN = median)
+row.names(med_by_cluster) <- paste0("C", med_by_cluster$cluster)
+med_by_cluster$cluster <- NULL
+# Z-score per feature for visualization
+M <- as.matrix(med_by_cluster)
+M_scaled <- t(scale(t(M)))
+
+png(file.path(outdir, "cluster_median_heatmap.png"), width = 1800, height = 1200, res = 200)
+pheatmap(M_scaled, cluster_rows = TRUE, cluster_cols = TRUE, show_rownames = TRUE, show_colnames = TRUE,
+         main = "Cluster median expression (z-scored)")
+dev.off()
+
+# UMAP colored by cluster
+df_plot <- data.frame(UMAP1 = umap_coords[,1],
+                      UMAP2 = umap_coords[,2],
+                      cluster = clusters)
+p <- ggplot(df_plot, aes(UMAP1, UMAP2, color = cluster)) +
+  geom_point(size = 0.3, alpha = 0.7) +
+  theme_minimal() +
+  ggtitle("UMAP colored by meta-cluster")
+ggsave(file.path(outdir, "umap_clusters.png"), p, width = 7, height = 5, dpi = 200)
+
+# Export per-cell table
+cell_dt <- as.data.table(X_tr_f)
+cell_dt[, cluster := clusters]
+cell_dt[, UMAP1 := umap_coords[,1]]
+cell_dt[, UMAP2 := umap_coords[,2]]
+fwrite(cell_dt, file.path(outdir, "cells_arcsinh_QC_UMAP_clusters.csv"))
+
+# Export per-cluster medians
+med_dt <- as.data.table(M)
+med_dt[, cluster := row.names(M)]
+setcolorder(med_dt, c("cluster", setdiff(colnames(med_dt), "cluster")))
+fwrite(med_dt, file.path(outdir, "cluster_medians.csv"))
+
+# Simple QC summaries
+sink(file.path(outdir, "summary.txt"))
+cat("File:", fcs_path, "\n")
+cat("Events total:", nrow(X_tr), "\n")
+cat("Events kept:", nrow(X_tr_f), "\n")
+cat("Features used (", length(features), "): ", paste(features, collapse = ", "), "\n", sep = "")
+cat("Meta-clusters (k):", k_meta, "\n")
+sink()
+
+Notes and tips
+- arcsinh cofactor: 5 is typical for CyTOF; if your signals look compressed, try 4–6.
+- QC thresholds: The above use heuristic quantiles. If you know your viability/bead/DNA channels and expected gates, replace quantile-based thresholds with explicit cutoffs or automated gating (e.g., flowDensity, openCyto, PeacoQC).
+- Feature selection: Replace the regex-based exclusion with a curated list of “type” markers (e.g., lineage markers) for more stable clustering.
+- Clustering granularity: Increase FlowSOM grid (xdim, ydim) for more fine-grained SOM nodes, and adjust k_meta to your biology (e.g., 20–40 for PBMC panels).
+- Reproducibility: Set seeds before UMAP and clustering to stabilize outputs.
+- Optional: Add t-SNE, differential abundance/marker testing (diffcyt), batch correction (not needed for a single file), and manual cluster annotation by marker heatmaps.
+
+If you prefer a CATALYST-based SCE pipeline (SingleCellExperiment object) with built-in plotting and cluster utilities, I can provide that version too.

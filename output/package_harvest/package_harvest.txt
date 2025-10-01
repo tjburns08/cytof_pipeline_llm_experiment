@@ -1,0 +1,79 @@
+claude_output_1.txt: BiocManager, CATALYST, ConsensusClusterPlus, FlowSOM, Rphenograph, Rtsne, SingleCellExperiment, flowCore, flowWorkspace, ggcyto, ggplot2, gridExtra, pheatmap, scater, umap, viridis
+
+claude_output_10.txt: BiocManager, CATALYST, ComplexHeatmap, ConsensusClusterPlus, FlowSOM, Rtsne, cytofkit, flowCore, ggplot2, uwot, viridis
+
+claude_output_2.txt: CATALYST, ConsensusClusterPlus, FlowSOM, RColorBrewer, Rphenograph, Rtsne, uwot, BiocManager, devtools, dplyr, flowCore, ggplot2, pheatmap, reshape2
+
+claude_output_3.txt: BiocManager, CATALYST, ConsensusClusterPlus, FlowSOM, RColorBrewer, Rtsne, SingleCellExperiment, cowplot, dplyr, flowCore, ggplot2, gridExtra, pheatmap, tidyr, umap
+
+claude_output_4.txt: BiocManager, CATALYST, ComplexHeatmap, ConsensusClusterPlus, FlowSOM, Rtsne, SingleCellExperiment, circlize, dplyr, flowCore, flowViz, ggplot2, reshape2, uwot, viridis
+
+claude_output_5.txt: CATALYST, ComplexHeatmap, FlowSOM, Rtsne, SingleCellExperiment, cowplot, diffcyt, dplyr, flowCore, ggplot2, tidyr, uwot, viridis
+
+claude_output_6.txt: CATALYST, ConsensusClusterPlus, FlowSOM, RColorBrewer, Rtsne, SingleCellExperiment, flowCore, ggplot2, gridExtra, pheatmap, uwot
+
+claude_output_7.txt: BiocManager, CATALYST, ComplexHeatmap, FlowSOM, Rtsne, SingleCellExperiment, dplyr, flowCore, ggplot2, uwot
+
+claude_output_8.txt: CATALYST, ConsensusClusterPlus, FlowSOM, Rphenograph, SingleCellExperiment, BiocManager, diffcyt, dplyr, flowCore, ggplot2, pheatmap, reshape2, scater, tidyr, python_language
+
+claude_output_9.txt: BiocManager, CATALYST, ConsensusClusterPlus, FlowSOM, RColorBrewer, Rtsne, SingleCellExperiment, flowCore, ggplot2, gridExtra, pheatmap, reshape2, umap
+
+gemini_output_1.txt: BiocManager, CATALYST, SingleCellExperiment, flowCore, ggplot2
+
+gemini_output_10.txt: BiocManager, CATALYST, FlowSOM, ggplot2, pheatmap, readr, scater, flowCore
+
+gemini_output_2.txt: BiocManager, CATALYST, flowCore, ggplot2, patchwork
+
+gemini_output_3.txt: BiocManager, CATALYST, flowCore, ggplot2, pheatmap
+
+gemini_output_4.txt: BiocManager, CATALYST, flowCore, tidyverse
+
+gemini_output_5.txt: BiocManager, CATALYST, cytofkit, dplyr, flowCore, ggplot2, scater, tidyr
+
+gemini_output_6.txt: CATALYST, RColorBrewer, SingleCellExperiment, BiocManager, diffcyt, flowCore, ggcyto, ggplot2, scater
+
+gemini_output_7.txt: BiocManager, CATALYST, flowCore, ggplot2, scater
+
+gemini_output_8.txt: CATALYST, SingleCellExperiment, BiocManager, cytofkit, flowCore, ggplot2, patchwork, scater
+
+gemini_output_9.txt: CATALYST, BiocManager, diffcyt, flowCore, patchwork, tidyverse
+
+gpt5_output_1.txt: CATALYST, FlowSOM, flowCore, ggplot2, uwot, data.table
+
+gpt5_output_10.txt: FlowSOM, flowCore, ggplot2, uwot, data.table, matrixStats, pheatmap
+
+gpt5_output_2.txt: CATALYST, ConsensusClusterPlus, FlowSOM, SingleCellExperiment, SummarizedExperiment, BiocManager, flowCore, ggplot2, scater, stringr, dplyr
+
+gpt5_output_3.txt: FlowSOM, flowCore, flowDensity, ggplot2, uwot, PeacoQC, remotes, reshape2
+
+gpt5_output_4.txt: CATALYST, FlowSOM, Rtsne, SingleCellExperiment, flowCore, ggplot2, uwot, data.table, premessa
+
+gpt5_output_5.txt: FlowSOM, SingleCellExperiment, flowCore, ggplot2, uwot, data.table, mclust, matrixStats, pheatmap
+
+gpt5_output_6.txt: CATALYST, FlowSOM, SingleCellExperiment, flowCore, ggplot2, scater, uwot, PeacoQC, dplyr
+
+gpt5_output_7.txt: CATALYST, FlowSOM, SingleCellExperiment, flowCore, ggplot2, scater
+
+gpt5_output_8.txt: FlowSOM, flowCore, ggplot2, uwot, PeacoQC, data.table, matrixStats
+
+gpt5_output_9.txt: CATALYST, ConsensusClusterPlus, FlowSOM, Rtsne, flowCore, flowDensity, ggplot2, uwot, BiocManager, data.table
+
+grok4_output_1.txt: CATALYST, FlowSOM, BiocManager, RColorBrewer, Seurat, flowCore, ggplot2, dplyr, pheatmap
+
+grok4_output_10.txt: CATALYST, FlowSOM, CytoML, BiocManager, flowCore, flowStats, flowViz, ggplot2, umap
+
+grok4_output_2.txt: CATALYST, FlowSOM, flowCore, flowStats, flowViz, ggplot2, pheatmap, tidyverse, umap
+
+grok4_output_3.txt: CATALYST, FlowSOM, cytofkit, flowCore, flowStats, ggplot2, umap
+
+grok4_output_4.txt: CATALYST, flowCore
+
+grok4_output_5.txt: CATALYST, FlowSOM, Rtsne, SingleCellExperiment, flowCore, ggplot2, umap
+
+grok4_output_6.txt: CATALYST, cytofkit, flowCore, ggplot2, Rtsne, umap
+
+grok4_output_7.txt: python_language
+
+grok4_output_8.txt: CATALYST, Rphenograph, flowCore, ggplot2, umap
+
+grok4_output_9.txt: python_language

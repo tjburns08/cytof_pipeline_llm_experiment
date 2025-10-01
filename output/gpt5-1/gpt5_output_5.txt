@@ -1,0 +1,329 @@
+Below is a concise, end-to-end R pipeline to analyze a single CyTOF (.fcs) file. It performs QC (optional bead removal, DNA/viability gating, singlet filtering), arcsinh transform, dimensionality reduction (UMAP), clustering (FlowSOM meta-clusters), and exports results (annotated FCS, CSVs, and basic plots).
+
+Instructions
+- Install R packages once: install.packages(c("flowCore","FlowSOM","uwot","ggplot2","data.table","mclust","matrixStats","pheatmap"))
+- If you use Bioconductor: install.packages("BiocManager"); BiocManager::install(c("SingleCellExperiment"))
+- Set the file path and optionally provide your preferred marker-channel mapping.
+
+R script (single-file workflow)
+
+```r
+# CyTOF single-file analysis pipeline
+# Author: Your Name
+# Reproducible seed:
+set.seed(1234)
+
+suppressPackageStartupMessages({
+  library(flowCore)
+  library(FlowSOM)
+  library(uwot)
+  library(ggplot2)
+  library(data.table)
+  library(mclust)
+  library(matrixStats)
+  library(pheatmap)
+  library(SingleCellExperiment)
+})
+
+# ----------------------------
+# User inputs
+# ----------------------------
+fcs_path <- "path/to/your_file.fcs"     # <- set path
+outdir   <- "cytof_out_single"
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+# arcsinh cofactor commonly 5 for CyTOF
+cofactor <- 5
+
+# Optional: override marker names (named character vector: names=channel names, values=marker names)
+# Leave empty to use FCS "desc" fields if present.
+panel_map_override <- c(
+  # "Y89Di"="CD45",
+  # "Nd142Di"="CD19",
+  # ...
+)
+
+# Target clustering resolution
+meta_k <- 20  # number of metaclusters
+
+# ----------------------------
+# Helpers
+# ----------------------------
+asinh_transform <- function(m, cfac=5) {
+  mapply(function(x) asinh(x/cfac), as.data.frame(m)) |> as.matrix()
+}
+
+safe_grep <- function(patterns, x, ignore.case=TRUE) {
+  id <- integer(0)
+  for (p in patterns) {
+    id <- union(id, grep(p, x, ignore.case = ignore.case))
+  }
+  sort(unique(id))
+}
+
+mix_threshold <- function(x) {
+  # Two-component Gaussian mixture; returns cutoff between components.
+  x <- x[is.finite(x)]
+  if (length(unique(x)) < 3) return(Inf)
+  fit <- try(Mclust(x, G=2, verbose=FALSE), silent=TRUE)
+  if (inherits(fit, "try-error") || is.null(fit$parameters)) return(Inf)
+  mu <- fit$parameters$mean
+  sig <- sqrt(fit$parameters$variance$sigmasq)
+  pi <- fit$parameters$pro
+  # Find intersection point of two normals
+  a <- 1/(2*sig[1]^2) - 1/(2*sig[2]^2)
+  b <- mu[2]/(sig[2]^2) - mu[1]/(sig[1]^2)
+  c <- (mu[1]^2)/(2*sig[1]^2) - (mu[2]^2)/(2*sig[2]^2) + log((pi[2]*sig[1])/(pi[1]*sig[2]))
+  disc <- b^2 - 4*a*c
+  if (disc < 0) return(mean(mu)) # fallback
+  roots <- c((-b + sqrt(disc))/(2*a), (-b - sqrt(disc))/(2*a))
+  # choose root between means if exists; else mean of means
+  r <- roots[roots > min(mu) & roots < max(mu)]
+  if (length(r) == 0) r <- mean(mu)
+  r[1]
+}
+
+robust_interval <- function(x, z=2.5) {
+  mu <- median(x, na.rm=TRUE)
+  s <- mad(x, constant=1.4826, na.rm=TRUE)
+  c(mu - z*s, mu + z*s)
+}
+
+# ----------------------------
+# Load FCS and extract metadata
+# ----------------------------
+ff <- read.FCS(fcs_path, transformation = FALSE, truncate_max_range = FALSE)
+expr <- exprs(ff)
+param <- pData(parameters(ff))
+colnames(expr) <- make.unique(colnames(expr))
+
+# Derive marker names: prefer 'desc' (antigen) if present, else channel ($PnN)
+marker_names <- param$desc
+if (is.null(marker_names) || all(is.na(marker_names))) {
+  marker_names <- param$name
+}
+names(marker_names) <- colnames(expr)
+
+# Apply user overrides
+if (length(panel_map_override) > 0) {
+  ovl <- intersect(names(panel_map_override), names(marker_names))
+  marker_names[ovl] <- panel_map_override[ovl]
+}
+# Fill NAs with channel name
+marker_names[is.na(marker_names) | marker_names==""] <- param$name[is.na(marker_names) | marker_names==""]
+names(marker_names) <- colnames(expr)
+
+# Identify common technical channels
+cn <- colnames(expr)
+mk <- marker_names
+
+# Time/event length/DNA/viability/beads
+time_idx  <- safe_grep(c("^Time$", "Time"), mk)
+evlen_idx <- safe_grep(c("Event[_ ]?length", "EventLength", "EvtLength", "length"), mk)
+dna_idx   <- union(safe_grep(c("Ir191", "191Ir", "DNA1", "DNA-1"), cn),
+                   safe_grep(c("Ir193", "193Ir", "DNA2", "DNA-2"), cn))
+viab_idx  <- safe_grep(c("cisplatin", "Pt", "195Pt", "198Pt", "Rh103", "103Rh", "viab"), mk)
+bead_idx  <- union(
+  safe_grep(c("140Ce","151Eu","153Eu","165Ho","175Lu","EQ","Bead"), cn),
+  safe_grep(c("140Ce","151Eu","153Eu","165Ho","175Lu","EQ","Bead"), mk)
+)
+
+# Keep indices unique and valid
+time_idx  <- intersect(time_idx, seq_len(ncol(expr)))
+evlen_idx <- intersect(evlen_idx, seq_len(ncol(expr)))
+dna_idx   <- intersect(dna_idx, seq_len(ncol(expr)))
+viab_idx  <- intersect(viab_idx, seq_len(ncol(expr)))
+bead_idx  <- intersect(bead_idx, seq_len(ncol(expr)))
+
+message("Detected channels:")
+message(sprintf("  Time: %s", paste(mk[time_idx], collapse=", ")))
+message(sprintf("  Event length: %s", paste(mk[evlen_idx], collapse=", ")))
+message(sprintf("  DNA: %s", paste(mk[dna_idx], collapse=", ")))
+message(sprintf("  Viability: %s", paste(mk[viab_idx], collapse=", ")))
+message(sprintf("  Beads: %s", paste(mk[bead_idx], collapse=", ")))
+
+# ----------------------------
+# Transform for gating/analysis
+# ----------------------------
+expr_tr <- asinh_transform(expr, cofactor)
+colnames(expr_tr) <- colnames(expr)
+
+# ----------------------------
+# Basic cleanup/gating
+# ----------------------------
+keep <- rep(TRUE, nrow(expr_tr))
+
+# 1) Remove calibration beads if bead channels exist
+if (length(bead_idx) > 0) {
+  bead_score <- rowSums(expr_tr[, bead_idx, drop=FALSE])
+  thr <- mix_threshold(bead_score)
+  keep <- keep & (bead_score < thr)
+  message(sprintf("Removed beads: %d", sum(! (bead_score < thr))))
+}
+
+# 2) Keep DNA+ (remove debris)
+if (length(dna_idx) >= 1) {
+  dna_score <- rowSums(expr_tr[, dna_idx, drop=FALSE])
+  thr <- mix_threshold(dna_score)
+  keep <- keep & (dna_score > thr)
+  message(sprintf("Removed DNA- debris: %d", sum(!(dna_score > thr))))
+}
+
+# 3) Remove dead cells using viability if present (cisplatin/Rh103 high = dead)
+if (length(viab_idx) >= 1) {
+  viab_score <- rowMaxs(expr_tr[, viab_idx, drop=FALSE])
+  thr <- mix_threshold(viab_score)
+  keep <- keep & (viab_score < thr)
+  message(sprintf("Removed dead (viability+): %d", sum(!(viab_score < thr))))
+}
+
+# 4) Singlets by event length (robust interval)
+if (length(evlen_idx) >= 1) {
+  el <- expr_tr[, evlen_idx[1]]
+  iv <- robust_interval(el, z=2.5)
+  singlets <- el >= iv[1] & el <= iv[2]
+  keep <- keep & singlets
+  message(sprintf("Removed potential doublets/multiplets: %d", sum(!singlets)))
+}
+
+# Apply filter
+expr_tr_f <- expr_tr[keep, , drop=FALSE]
+message(sprintf("Events kept: %d / %d", nrow(expr_tr_f), nrow(expr_tr)))
+
+# ----------------------------
+# Select features for clustering/DR
+# Exclude technical channels: time, event_length, DNA, viability, beads
+# ----------------------------
+tech_idx <- unique(c(time_idx, evlen_idx, dna_idx, viab_idx, bead_idx))
+feature_idx <- setdiff(seq_len(ncol(expr_tr_f)), tech_idx)
+
+# Further exclude very low-variance channels
+vars <- matrixStats::colVars(expr_tr_f[, feature_idx, drop=FALSE])
+feature_idx <- feature_idx[vars > quantile(vars, 0.1, na.rm=TRUE)]
+
+feature_names <- mk[feature_idx]
+message(sprintf("Using %d features for clustering/DR:", length(feature_idx)))
+message(paste(feature_names, collapse=", "))
+
+# ----------------------------
+# Dimensionality reduction (UMAP)
+# ----------------------------
+umap_coords <- umap(expr_tr_f[, feature_idx, drop=FALSE],
+                    n_neighbors=15, min_dist=0.2, metric="euclidean",
+                    n_threads=max(1, parallel::detectCores()-1), verbose=TRUE)
+colnames(umap_coords) <- c("UMAP1","UMAP2")
+
+# ----------------------------
+# Clustering with FlowSOM + metaclustering
+# ----------------------------
+# Build a temporary flowFrame to feed FlowSOM
+ff_clean <- new("flowFrame", exprs = expr_tr_f)
+# FlowSOM expects columns to use; pass feature_idx
+fsom <- ReadInput(ff_clean, transform = FALSE, scale = FALSE)
+fsom <- BuildSOM(fsom, colsToUse = feature_idx, xdim = 10, ydim = 10)
+fsom <- BuildMST(fsom)
+meta <- metaClustering_consensus(fsom$map$codes, k = meta_k, seed=1234)
+cluster_ids <- meta[fsom$map$mapping[,1]]
+cluster_ids <- as.integer(cluster_ids)
+
+# ----------------------------
+# Summaries and outputs
+# ----------------------------
+# Assemble cell-level data table
+dt_cells <- data.table(
+  cell_id = which(keep),
+  cluster_id = cluster_ids,
+  UMAP1 = umap_coords[,1],
+  UMAP2 = umap_coords[,2]
+)
+
+# Per-cluster marker medians
+marker_meds <- t(apply(expr_tr_f, 2, function(col) tapply(col, cluster_ids, median, na.rm=TRUE)))
+cluster_medians <- data.table(cluster_id = as.integer(colnames(marker_meds)))
+cluster_medians <- data.table(cluster_id = seq_len(ncol(marker_meds)),
+                              marker_meds = I(split(marker_meds, row(marker_meds))))
+# Expand to wide
+cluster_medians_wide <- data.table(cluster_id = seq_len(ncol(marker_meds)))
+for (j in seq_len(nrow(marker_meds))) {
+  cluster_medians_wide[[colnames(expr_tr_f)[j]]] <- marker_meds[j, ]
+}
+# Add counts
+cluster_counts <- as.data.table(table(cluster_ids))
+setnames(cluster_counts, c("cluster_ids","N"))
+cluster_counts[, cluster_id := as.integer(as.character(cluster_ids))]
+cluster_counts[, cluster_ids := NULL]
+cluster_medians_wide <- merge(cluster_medians_wide, cluster_counts, by="cluster_id", all.x=TRUE)
+
+# Save CSVs
+fwrite(dt_cells, file.path(outdir, "cells_annotations.csv"))
+fwrite(cluster_medians_wide, file.path(outdir, "cluster_medians_and_counts.csv"))
+
+# Save annotated FCS (transformed intensities + UMAP + cluster)
+expr_out <- expr_tr
+extra <- matrix(NA_real_, nrow=nrow(expr_out), ncol=3)
+colnames(extra) <- c("UMAP1","UMAP2","cluster_id")
+extra[keep,1:2] <- umap_coords
+extra[keep,3] <- cluster_ids
+expr_out2 <- cbind(expr_out, extra)
+ff_out <- ff
+exprs(ff_out) <- expr_out2
+write.FCS(ff_out, filename = file.path(outdir, "annotated_transformed.fcs"))
+
+# ----------------------------
+# Basic visualizations
+# ----------------------------
+# UMAP by cluster
+p1 <- ggplot(as.data.frame(dt_cells), aes(UMAP1, UMAP2, color=factor(cluster_id))) +
+  geom_point(size=0.3, alpha=0.6) + theme_minimal() + guides(color=guide_legend(override.aes=list(size=3, alpha=1))) +
+  labs(color="cluster_id", title="UMAP by FlowSOM metaclusters")
+ggsave(file.path(outdir, "umap_by_cluster.png"), p1, width=6, height=5, dpi=200)
+
+# Heatmap of cluster medians for selected markers (top variable features)
+sel_features <- feature_idx
+med_mat <- marker_meds[sel_features, , drop=FALSE]
+rownames(med_mat) <- mk[sel_features]
+colnames(med_mat) <- paste0("C", seq_len(ncol(med_mat)))
+pheatmap(med_mat, scale="row", clustering_method="average", fontsize_row=6, main="Cluster median (asinh)")
+ggsave(file.path(outdir, "cluster_median_heatmap.png"), width=7, height=8, dpi=200)
+
+# Example of UMAP colored by a marker (e.g., CD45 if present)
+example_marker <- names(which.max(colVars(expr_tr_f[, feature_idx, drop=FALSE])))
+if (!is.null(example_marker)) {
+  df_um <- as.data.frame(dt_cells)
+  df_um[[example_marker]] <- expr_tr_f[, example_marker]
+  p2 <- ggplot(df_um, aes(UMAP1, UMAP2, color=!!as.name(example_marker))) +
+    geom_point(size=0.3, alpha=0.6) + theme_minimal() + scale_color_viridis_c() +
+    labs(title=paste("UMAP colored by", example_marker))
+  ggsave(file.path(outdir, sprintf("umap_by_%s.png", gsub("[^A-Za-z0-9]+","_", example_marker))), p2, width=6, height=5, dpi=200)
+}
+
+# ----------------------------
+# Session info for reproducibility
+# ----------------------------
+sink(file.path(outdir, "sessionInfo.txt"))
+print(sessionInfo())
+sink()
+
+message("Done. Outputs in: ", outdir)
+```
+
+What this pipeline does
+- Reads one FCS file (no compensation needed for CyTOF).
+- Detects common technical channels (time, event length, DNA, viability, beads) heuristically.
+- Applies arcsinh transform (cofactor 5).
+- Removes beads (if present) via a 2-component mixture cutoff on aggregated bead signal.
+- Keeps DNA+ events; removes dead cells if viability channel present; filters doublets via event-length robust interval.
+- Uses remaining channels as features (excluding technical and very low-variance markers).
+- Runs UMAP on feature markers for visualization.
+- Clusters with FlowSOM (10x10 map) and meta-clusters into k=20 groups; you can adjust meta_k.
+- Exports:
+  - cells_annotations.csv with cell_id, cluster_id, UMAP1/UMAP2 for kept events.
+  - cluster_medians_and_counts.csv with asinh medians per cluster and counts.
+  - annotated_transformed.fcs: original file with arcsinh-transformed intensities plus UMAP1/UMAP2 and cluster_id columns.
+  - Basic plots (UMAP by cluster, cluster heatmap, optional UMAP by a marker).
+
+Notes and tips
+- If your acquisition included barcode deconvolution or vendor bead normalization, run those upstream or adapt the script.
+- For better feature selection, mark lineage (“type”) markers versus signaling (“state”) markers and cluster on type markers only.
+- Thresholding is automated with mixture models but should be reviewed; you can hard-code gates once decided.
+- For multiple files/batches, prefer normalization methods like CytoNorm and modeling with diffcyt for differential analyses.

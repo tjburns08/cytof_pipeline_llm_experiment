@@ -1,0 +1,296 @@
+Below is a practical, end‑to‑end CyTOF (mass cytometry) analysis pipeline for a single FCS file, using the standard R/Bioconductor toolchain. It covers import, optional bead normalization, QC/cleanup, transformation, clustering, dimensionality reduction, and export. It is designed to run as-is once you edit paths and channel names.
+
+High-level steps
+- Inputs: a single FCS file and a panel (mapping channel names to markers and marker classes).
+- Optional bead-based normalization and bead removal (if the file is raw/non-normalized).
+- QC and cleanup: remove acquisition anomalies, beads (if not removed earlier), debris, dead cells, and doublets.
+- Transform data (arcsinh with cofactor 5).
+- Build SingleCellExperiment with CATALYST.
+- Clustering (FlowSOM + meta-clustering) using lineage markers.
+- Dimensionality reduction (UMAP or t-SNE).
+- Summaries and export.
+
+Required R packages
+- BiocManager
+- CATALYST, flowCore, FlowSOM, SingleCellExperiment
+- uwot (UMAP), Rtsne (t-SNE), ggplot2, data.table
+- Optional: premessa (for bead normalization), flowAI or flowCut (acquisition QC), Rphenograph
+
+R script (edit paths, channel/marker names, and options marked with TODO)
+--------------------------------------------------------------------------------
+# 0) Setup ---------------------------------------------------------------------
+
+# Install (first time only):
+# install.packages(c("BiocManager","ggplot2","data.table","uwot","Rtsne"))
+# BiocManager::install(c("CATALYST","flowCore","FlowSOM","SingleCellExperiment"))
+# Optional for bead normalization:
+# install.packages("premessa")
+
+library(flowCore)
+library(CATALYST)
+library(FlowSOM)
+library(SingleCellExperiment)
+library(ggplot2)
+library(uwot)
+library(Rtsne)
+library(data.table)
+# optional
+# library(premessa)
+
+set.seed(1234)
+
+# 1) Inputs --------------------------------------------------------------------
+
+# TODO: point to your single FCS file
+fcs_file <- "path/to/your_file.fcs"
+
+# TODO: define panel mapping (fcs_colname must match colnames in the FCS; antigen is human-readable)
+# marker_class typically: "type" (lineage) vs "state" (functional), others: "none", "dna", "viability", "bead"
+# You can start by inspecting colnames(flowCore::read.FCS(...)) to fill this
+panel <- data.frame(
+  fcs_colname = c(
+    "Ir191Di","Ir193Di","Pt195Di",                # DNA, viability
+    "Ce140Di","Eu151Di","Eu153Di","Ho165Di","Lu175Di",  # Beads
+    # lineage/state markers below (examples; replace with your channels)
+    "Cd45_89Y","CD3_170Er","CD4_145Nd","CD8_146Nd",
+    "CD19_142Nd","CD14_160Gd","CD56_176Yb","HLA-DR_174Yb"
+  ),
+  antigen = c(
+    "DNA1","DNA2","Cisplatin",
+    "Ce140","Eu151","Eu153","Ho165","Lu175",
+    "CD45","CD3","CD4","CD8","CD19","CD14","CD56","HLA-DR"
+  ),
+  marker_class = c(
+    "dna","dna","viability",
+    "bead","bead","bead","bead","bead",
+    "type","type","type","type","type","type","type","type"
+  ),
+  stringsAsFactors = FALSE
+)
+
+# Channels to exclude from expression analyses (instrument/technical)
+technical_channels <- c("Time","Event_length","Center","Width","Residual")
+
+# 2) Optional: bead normalization ----------------------------------------------
+# If your file is already normalized (e.g., name contains "normalized" or you know it is),
+# skip this block. Otherwise, uncomment and run using premessa or CATALYST::normCytof.
+
+# if (requireNamespace("premessa", quietly = TRUE)) {
+#   out_dir <- "normalized_fcs"
+#   dir.create(out_dir, showWarnings = FALSE)
+#   premessa::normalize(
+#     files = fcs_file,
+#     beads = c("Ce140Di","Eu151Di","Eu153Di","Ho165Di","Lu175Di"),
+#     output = out_dir,
+#     remove_beads = TRUE,      # removes bead events
+#     cofactor = 5,             # transform for normalization model; does not affect later arcsinh
+#     overwrite = TRUE
+#   )
+#   fcs_file <- file.path(out_dir, basename(fcs_file))
+# }
+
+# Alternative (CATALYST wrapper; writes normalized FCS to disk):
+# CATALYST::normCytof(files = fcs_file, beads = c("Ce140Di","Eu151Di","Eu153Di","Ho165Di","Lu175Di"), out_dir = "normalized_fcs", remove_beads = TRUE)
+
+# 3) Read the FCS and basic checks ---------------------------------------------
+
+fs <- read.FCS(fcs_file, transformation = FALSE, truncate_max_range = FALSE)
+ch_names <- colnames(fs)
+message("Detected channels:"); print(ch_names)
+
+# Ensure panel rows match FCS channels present
+if (!all(panel$fcs_colname %in% ch_names)) {
+  stop("Some panel fcs_colname entries are not found in the FCS. Fix panel mappings.")
+}
+
+# 4) Build SingleCellExperiment and transform ----------------------------------
+
+# Define which channels to use as features (exclude DNA, viability, beads, technical)
+use_markers <- panel$antigen[
+  panel$marker_class %in% c("type","state")
+]
+
+# Build SCE via CATALYST::prepData
+# prepData expects a flowSet or file paths and a panel with columns: fcs_colname, antigen, marker_class
+sce <- prepData(
+  input = fs,
+  panel = panel,
+  md = data.frame(file_name = basename(fcs_file), sample_id = "sample1", stringsAsFactors = FALSE),
+  features = panel$antigen,   # will include all annotated antigens; we can subset later
+  transform = TRUE,            # arcsinh
+  cofactor = 5
+)
+
+# 5) Cleanup gating (debris, dead, doublets, anomalies) ------------------------
+# Notes:
+# - If bead removal was done in normalization, beads should be gone.
+# - Adjust channel names below to your panel.
+# - Thresholds are estimated automatically using density minima; inspect and adjust as needed.
+
+# Helper to find a cutpoint between two modes (simple valley finder)
+find_bimodal_cut <- function(x) {
+  x <- x[is.finite(x)]
+  d <- density(x, bw = "nrd0", n = 2^12)
+  # local minima
+  minima <- which(diff(sign(diff(d$y))) == 2) + 1
+  if (length(minima) == 0) return(quantile(x, 0.99, na.rm = TRUE))
+  # pick the deepest minimum
+  min_idx <- minima[which.min(d$y[minima])]
+  d$x[min_idx]
+}
+
+# Extract expression matrix on key cleanup channels
+dna1 <- assay(sce, "exprs")[, "DNA1", drop = TRUE]
+dna2 <- assay(sce, "exprs")[, "DNA2", drop = TRUE]
+viab <- if ("Cisplatin" %in% rownames(rowData(sce))) assay(sce, "exprs")[, "Cisplatin", drop = TRUE] else rep(NA, ncol(sce))
+evtlen <- if ("Event_length" %in% ch_names) exprs(fs)[, "Event_length"] else rep(NA, nrow(exprs(fs)))
+time_ch <- if ("Time" %in% ch_names) exprs(fs)[, "Time"] else rep(NA, nrow(exprs(fs)))
+resid <- if ("Residual" %in% ch_names) exprs(fs)[, "Residual"] else rep(NA, nrow(exprs(fs)))
+
+# DNA gating: keep nuclei-positive events
+dna1_cut <- find_bimodal_cut(dna1)
+dna2_cut <- find_bimodal_cut(dna2)
+keep_dna <- (dna1 > dna1_cut) & (dna2 > dna2_cut)
+
+# Viability gating: keep cisplatin-low (live)
+keep_live <- rep(TRUE, length(viab))
+if (any(is.finite(viab))) {
+  viab_cut <- find_bimodal_cut(viab)
+  keep_live <- viab <= viab_cut
+}
+
+# Event length/doublet gate: retain middle quantiles
+keep_evtlen <- rep(TRUE, length(evtlen))
+if (any(is.finite(evtlen))) {
+  q <- quantile(evtlen, probs = c(0.01, 0.99), na.rm = TRUE)
+  keep_evtlen <- evtlen >= q[1] & evtlen <= q[2]
+}
+
+# Acquisition anomaly removal by time using simple rolling median per time bin
+keep_time <- rep(TRUE, length(time_ch))
+if (any(is.finite(time_ch))) {
+  # bin by time, check median DNA and total signal deviations
+  dt <- data.table(
+    idx = seq_along(time_ch),
+    time = time_ch,
+    dna = dna1 + dna2
+  )
+  dt[, bin := cut(time, breaks = 200)]  # 200 bins; adjust for your file length
+  med_by_bin <- dt[, .(med_dna = median(dna, na.rm = TRUE)), by = bin]
+  med_all <- median(med_by_bin$med_dna, na.rm = TRUE)
+  mad_all <- mad(med_by_bin$med_dna, na.rm = TRUE)
+  bad_bins <- med_by_bin$bin[abs(med_by_bin$med_dna - med_all) > 4 * mad_all]
+  if (length(bad_bins)) {
+    keep_time <- !(dt$bin %in% bad_bins)
+  }
+}
+
+# Residual gate if available
+keep_resid <- rep(TRUE, length(resid))
+if (any(is.finite(resid))) {
+  r_cut <- quantile(resid, 0.99, na.rm = TRUE)
+  keep_resid <- resid <= r_cut
+}
+
+keep <- keep_dna & keep_live & keep_evtlen & keep_time & keep_resid
+
+sce <- sce[, keep]
+message(sprintf("Kept %d/%d events after cleanup.", ncol(sce), length(keep)))
+
+# 6) Optional: spillover compensation (minor metal spillover) ------------------
+# If you have an empirically derived spillover matrix (markers x markers), apply:
+# spill_mat <- as.matrix(read.csv("path/to/spillover_matrix.csv", row.names = 1))
+# sce <- compCytof(sce, spillover = spill_mat)
+
+# 7) Select features for clustering and DR -------------------------------------
+
+# Use only type (lineage) and/or selected functional markers for clustering
+clustering_markers <- panel$antigen[panel$marker_class %in% c("type","state")]
+# Optionally drop dim/low-quality channels from clustering_markers here.
+
+# 8) Dimensionality reduction ---------------------------------------------------
+
+# UMAP
+sce <- runDR(sce, dr = "UMAP", features = clustering_markers, cells = NULL, seed = 1234)
+# t-SNE (optional)
+# sce <- runDR(sce, dr = "TSNE", features = clustering_markers, perplexity = 60, seed = 1234)
+
+# 9) Clustering (FlowSOM + meta-clustering) ------------------------------------
+
+sce <- cluster(
+  sce,
+  features = clustering_markers,
+  xdim = 10, ydim = 10,            # SOM grid size
+  maxK = 30,                       # explore up to 30 meta-clusters
+  seed = 1234, verbose = FALSE
+)
+
+# Pick a K; you can inspect delta area and choose. For simplicity:
+chosen_k <- 20
+cluster_ids <- cluster_ids(sce, k = chosen_k)
+table(cluster_ids)
+
+# 10) Summaries and plots ------------------------------------------------------
+
+# Heatmap of cluster medians
+pdf("cluster_heatmap.pdf", width = 10, height = 8)
+print(plotClusterHeatmap(
+  sce, k = chosen_k, features = clustering_markers,
+  scale = TRUE, draw_freqs = TRUE, draw_lines = TRUE
+))
+dev.off()
+
+# UMAP colored by cluster
+umap_df <- as.data.frame(reducedDim(sce, "UMAP"))
+umap_df$cluster <- factor(cluster_ids)
+pdf("umap_clusters.pdf", width = 7, height = 6)
+print(ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = cluster)) +
+        geom_point(size = 0.2, alpha = 0.6) +
+        theme_minimal())
+dev.off()
+
+# Cluster medians per marker
+meds <- aggregateData(
+  sce, assay = "exprs", fun = "median",
+  by = "cluster_id", k = chosen_k, features = clustering_markers
+)
+write.csv(as.data.frame(meds), "cluster_marker_medians.csv", row.names = FALSE)
+
+# 11) Export annotated events --------------------------------------------------
+
+# Write cluster labels per event
+event_tab <- data.table(
+  cell_id = seq_len(ncol(sce)),
+  cluster = cluster_ids
+)
+write.csv(event_tab, "event_cluster_assignments.csv", row.names = FALSE)
+
+# Optionally write an FCS with cluster as a new parameter
+# Note: add a new channel "cluster" to exprs and write
+expr_mat <- t(assay(sce, "exprs"))
+expr_aug <- cbind(expr_mat, cluster = as.numeric(cluster_ids))
+ff <- flowFrame(expr_aug)
+# Carry over parameter names
+p <- parameters(fs)
+# Append a new parameter for cluster
+new_param <- list(name = "cluster", desc = "FlowSOM_meta_cluster", range = max(expr_aug[,"cluster"], na.rm = TRUE))
+# Build new parameter description safely
+pd <- p@data
+pd <- rbind(pd, data.frame(name = "cluster", desc = "FlowSOM_meta_cluster", range = new_param$range,
+                           minRange = 0, maxRange = new_param$range, stringsAsFactors = FALSE))
+parameters(ff)@data <- pd
+write.FCS(ff, filename = "sample_with_clusters.fcs", what = "numeric")
+
+# 12) Save SCE for downstream work --------------------------------------------
+
+saveRDS(sce, file = "sce_single_sample.rds")
+
+Practical notes
+- Panel annotation is crucial. Ensure fcs_colname matches exactly and classify markers as type/state/dna/viability/bead.
+- Normalization: If you used on-instrument normalization or have pre-normalized FCS, skip the normalization step. If not, use premessa or CATALYST’s wrapper with EQ bead channels (Ce140, Eu151, Eu153, Ho165, Lu175).
+- Cleanup thresholds should be inspected visually the first time. Consider plotting DNA vs event length, DNA vs viability, and Time vs total signal to confirm gates. For automated gating, packages like openCyto/flowDensity can replace the simple cutpoint code above.
+- Cofactor: arcsinh with cofactor 5 is standard for CyTOF; adjust if your lab uses 5 or 10.
+- Clustering: Choose K by inspecting plotClusterHeatmap and delta area plots (cluster_codes(sce) includes diagnostics). You can relabel clusters to cell types by marker medians.
+- Outputs: SCE RDS, PDF plots, CSV summaries, and an FCS with cluster labels are produced for easy sharing or visualization.
+
+If you prefer a Python workflow, you can use fcsparser + scanpy + phenograph, but the R/Bioc ecosystem (CATALYST, FlowSOM) is currently the most mature for CyTOF.

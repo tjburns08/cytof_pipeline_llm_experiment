@@ -1,0 +1,495 @@
+# CyTOF Analysis Pipeline for Single File
+
+Here's a comprehensive CyTOF analysis pipeline in R for analyzing a single FCS file:
+
+```r
+# ============================================================================
+# CyTOF Single File Analysis Pipeline
+# ============================================================================
+
+# Install required packages (run once)
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install(c("flowCore", "CATALYST", "SingleCellExperiment", 
+                       "scater", "ConsensusClusterPlus", "FlowSOM", 
+                       "Rphenograph", "diffcyt"))
+
+# Load libraries
+library(flowCore)
+library(CATALYST)
+library(SingleCellExperiment)
+library(ggplot2)
+library(dplyr)
+library(FlowSOM)
+library(ConsensusClusterPlus)
+library(scater)
+
+# ============================================================================
+# 1. DATA LOADING AND PREPROCESSING
+# ============================================================================
+
+# Set working directory
+setwd("path/to/your/data")
+
+# Load FCS file
+fcs_file <- "sample.fcs"
+ff <- read.FCS(fcs_file, transformation = FALSE, truncate_max_range = FALSE)
+
+# View file information
+print(paste("Events:", nrow(ff)))
+print(paste("Parameters:", ncol(ff)))
+colnames(ff)
+
+# ============================================================================
+# 2. DEFINE PANEL INFORMATION
+# ============================================================================
+
+# Create panel data frame (customize based on your panel)
+panel <- data.frame(
+    fcs_colname = colnames(ff),
+    antigen = gsub(".*_", "", colnames(ff)),  # Extract marker names
+    marker_class = "state"  # or "type" for lineage markers
+)
+
+# Specify which markers are lineage vs state markers
+lineage_markers <- c("CD45", "CD3", "CD4", "CD8", "CD19", "CD14", "CD56")
+state_markers <- c("pSTAT1", "pSTAT3", "pSTAT5", "Ki67", "pS6")
+
+panel$marker_class <- ifelse(panel$antigen %in% lineage_markers, "type", "state")
+
+# Specify which markers to use for clustering
+panel$use_for_clustering <- panel$antigen %in% lineage_markers
+
+print(panel)
+
+# ============================================================================
+# 3. DATA TRANSFORMATION
+# ============================================================================
+
+# Arcsinh transformation (cofactor = 5 is typical for CyTOF)
+cofactor <- 5
+
+# Extract expression matrix
+expr <- exprs(ff)
+
+# Apply arcsinh transformation
+expr_transformed <- asinh(expr / cofactor)
+
+# Create SingleCellExperiment object
+sce <- SingleCellExperiment(
+    assays = list(
+        counts = t(expr),
+        exprs = t(expr_transformed)
+    ),
+    colData = data.frame(
+        sample_id = basename(fcs_file),
+        condition = "sample1"
+    ),
+    rowData = panel
+)
+
+# Add metadata
+metadata(sce)$experiment_info <- list(
+    file_name = fcs_file,
+    n_cells = nrow(ff),
+    cofactor = cofactor
+)
+
+# ============================================================================
+# 4. QUALITY CONTROL
+# ============================================================================
+
+# Plot event length vs DNA to identify doublets
+if ("Event_length" %in% colnames(ff) & any(grepl("DNA|Ir191|Ir193", colnames(ff)))) {
+    event_length <- exprs(ff)[, "Event_length"]
+    dna_channel <- exprs(ff)[, grep("DNA|Ir191|Ir193", colnames(ff))[1]]
+    
+    qc_df <- data.frame(
+        Event_length = event_length,
+        DNA = dna_channel
+    )
+    
+    p1 <- ggplot(qc_df, aes(x = Event_length, y = DNA)) +
+        geom_hex(bins = 100) +
+        scale_fill_viridis_c() +
+        theme_minimal() +
+        labs(title = "Event Length vs DNA")
+    
+    print(p1)
+}
+
+# Check for bead events (if bead channels present)
+bead_channels <- grep("Bead|140|151|153|165|175", colnames(ff), value = TRUE)
+
+if (length(bead_channels) > 0) {
+    bead_signal <- rowSums(exprs(ff)[, bead_channels])
+    
+    p2 <- ggplot(data.frame(bead_signal = bead_signal), aes(x = bead_signal)) +
+        geom_histogram(bins = 100) +
+        theme_minimal() +
+        labs(title = "Bead Signal Distribution")
+    
+    print(p2)
+}
+
+# ============================================================================
+# 5. CELL FILTERING
+# ============================================================================
+
+# Filter cells based on DNA content (live cells)
+if (any(grepl("DNA|Ir191|Ir193", colnames(ff)))) {
+    dna_channel <- grep("DNA|Ir191|Ir193", colnames(ff), value = TRUE)[1]
+    dna_values <- expr_transformed[, dna_channel]
+    
+    # Set threshold (adjust as needed)
+    dna_threshold <- 3
+    
+    cells_to_keep <- dna_values > dna_threshold
+    
+    print(paste("Cells passing DNA filter:", sum(cells_to_keep), 
+                "out of", length(cells_to_keep)))
+    
+    sce <- sce[, cells_to_keep]
+    expr_transformed <- expr_transformed[cells_to_keep, ]
+}
+
+# ============================================================================
+# 6. DIMENSIONALITY REDUCTION
+# ============================================================================
+
+# Select markers for dimensionality reduction
+clustering_markers <- panel$antigen[panel$use_for_clustering]
+clustering_cols <- which(panel$use_for_clustering)
+
+# Run UMAP
+set.seed(123)
+sce <- runUMAP(sce, 
+               subset_row = clustering_cols,
+               exprs_values = "exprs",
+               n_neighbors = 15,
+               min_dist = 0.1)
+
+# Run tSNE
+set.seed(123)
+sce <- runTSNE(sce,
+               subset_row = clustering_cols,
+               exprs_values = "exprs",
+               perplexity = 30)
+
+# Plot UMAP
+plotReducedDim(sce, dimred = "UMAP") +
+    ggtitle("UMAP projection")
+
+# ============================================================================
+# 7. CLUSTERING WITH FlowSOM
+# ============================================================================
+
+# Prepare data for FlowSOM
+expr_clustering <- expr_transformed[, clustering_cols]
+colnames(expr_clustering) <- clustering_markers
+
+# Build FlowSOM
+set.seed(123)
+fsom <- FlowSOM(
+    input = expr_clustering,
+    colsToUse = 1:ncol(expr_clustering),
+    xdim = 10,
+    ydim = 10,
+    nClus = 20,  # Number of metaclusters
+    scale = FALSE
+)
+
+# Extract cluster labels
+clusters <- fsom$metaclustering[fsom$FlowSOM$map$mapping[,1]]
+
+# Add clusters to SCE
+sce$flowsom_cluster <- factor(clusters)
+
+# Plot UMAP colored by cluster
+plotReducedDim(sce, dimred = "UMAP", colour_by = "flowsom_cluster") +
+    ggtitle("FlowSOM Clusters on UMAP")
+
+# ============================================================================
+# 8. CONSENSUS CLUSTERING (Alternative)
+# ============================================================================
+
+# Perform ConsensusClusterPlus
+dir.create("consensus_clustering", showWarnings = FALSE)
+
+mc <- ConsensusClusterPlus(
+    t(expr_clustering),
+    maxK = 25,
+    reps = 100,
+    pItem = 0.9,
+    pFeature = 1,
+    clusterAlg = "km",
+    distance = "euclidean",
+    seed = 123,
+    plot = "png",
+    writeTable = FALSE,
+    title = "consensus_clustering/consensus"
+)
+
+# Extract optimal number of clusters (e.g., k=15)
+k_optimal <- 15
+consensus_clusters <- mc[[k_optimal]]$consensusClass
+
+sce$consensus_cluster <- factor(consensus_clusters)
+
+# ============================================================================
+# 9. CLUSTER CHARACTERIZATION
+# ============================================================================
+
+# Calculate median marker expression per cluster
+cluster_medians <- aggregate(
+    expr_transformed, 
+    by = list(cluster = sce$flowsom_cluster),
+    FUN = median
+)
+
+# Heatmap of cluster markers
+library(pheatmap)
+
+heatmap_data <- as.matrix(cluster_medians[, -1])
+rownames(heatmap_data) <- paste0("Cluster_", cluster_medians$cluster)
+
+pheatmap(
+    heatmap_data[, clustering_cols],
+    scale = "column",
+    clustering_distance_rows = "euclidean",
+    clustering_distance_cols = "euclidean",
+    main = "Cluster Marker Expression Heatmap",
+    fontsize = 8
+)
+
+# ============================================================================
+# 10. CLUSTER ABUNDANCE
+# ============================================================================
+
+# Calculate cluster frequencies
+cluster_freq <- table(sce$flowsom_cluster)
+cluster_prop <- prop.table(cluster_freq) * 100
+
+cluster_summary <- data.frame(
+    Cluster = names(cluster_freq),
+    Count = as.numeric(cluster_freq),
+    Percentage = as.numeric(cluster_prop)
+)
+
+print(cluster_summary)
+
+# Plot cluster abundance
+ggplot(cluster_summary, aes(x = Cluster, y = Percentage)) +
+    geom_bar(stat = "identity", fill = "steelblue") +
+    theme_minimal() +
+    labs(title = "Cluster Abundance", y = "Percentage of Cells") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# ============================================================================
+# 11. MARKER EXPRESSION VISUALIZATION
+# ============================================================================
+
+# Plot specific markers on UMAP
+markers_to_plot <- clustering_markers[1:min(4, length(clustering_markers))]
+
+for (marker in markers_to_plot) {
+    marker_idx <- which(panel$antigen == marker)
+    
+    p <- plotReducedDim(sce, dimred = "UMAP", 
+                        colour_by = marker_idx,
+                        by_exprs_values = "exprs") +
+        scale_color_viridis_c() +
+        ggtitle(paste(marker, "Expression"))
+    
+    print(p)
+}
+
+# Violin plots by cluster
+library(tidyr)
+library(reshape2)
+
+plot_data <- data.frame(
+    cluster = sce$flowsom_cluster,
+    t(assay(sce, "exprs"))
+)
+
+# Reshape for plotting
+plot_long <- pivot_longer(
+    plot_data,
+    cols = -cluster,
+    names_to = "marker",
+    values_to = "expression"
+)
+
+# Filter to specific markers
+plot_long_filtered <- plot_long %>%
+    filter(marker %in% paste0("X", clustering_cols))
+
+ggplot(plot_long_filtered, aes(x = cluster, y = expression, fill = cluster)) +
+    geom_violin(scale = "width") +
+    facet_wrap(~marker, scales = "free_y", ncol = 4) +
+    theme_minimal() +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = "Marker Expression by Cluster")
+
+# ============================================================================
+# 12. EXPORT RESULTS
+# ============================================================================
+
+# Create output directory
+dir.create("output", showWarnings = FALSE)
+
+# Export cluster assignments
+cluster_results <- data.frame(
+    cell_id = 1:ncol(sce),
+    flowsom_cluster = sce$flowsom_cluster,
+    UMAP1 = reducedDim(sce, "UMAP")[, 1],
+    UMAP2 = reducedDim(sce, "UMAP")[, 2],
+    tSNE1 = reducedDim(sce, "tSNE")[, 1],
+    tSNE2 = reducedDim(sce, "tSNE")[, 2]
+)
+
+write.csv(cluster_results, "output/cluster_assignments.csv", row.names = FALSE)
+
+# Export median expression values
+write.csv(cluster_medians, "output/cluster_medians.csv", row.names = FALSE)
+
+# Export cluster summary
+write.csv(cluster_summary, "output/cluster_summary.csv", row.names = FALSE)
+
+# Save R object
+saveRDS(sce, "output/sce_analyzed.rds")
+
+# ============================================================================
+# 13. GENERATE SUMMARY REPORT
+# ============================================================================
+
+cat("\n=== CyTOF Analysis Summary ===\n")
+cat(paste("File analyzed:", fcs_file, "\n"))
+cat(paste("Total cells after filtering:", ncol(sce), "\n"))
+cat(paste("Number of markers:", nrow(sce), "\n"))
+cat(paste("Number of clusters:", length(unique(sce$flowsom_cluster)), "\n"))
+cat("\nCluster distribution:\n")
+print(cluster_summary)
+
+cat("\n=== Analysis Complete ===\n")
+cat("Results saved in 'output' directory\n")
+```
+
+## Additional Python Alternative (using scanpy)
+
+```python
+# ============================================================================
+# CyTOF Analysis Pipeline - Python/Scanpy Version
+# ============================================================================
+
+import numpy as np
+import pandas as pd
+import scanpy as sc
+import matplotlib.pyplot as plt
+import seaborn as sns
+from fcsparser import parse
+
+# Configuration
+sc.settings.verbosity = 3
+sc.settings.set_figure_params(dpi=80, facecolor='white')
+
+# ============================================================================
+# 1. LOAD DATA
+# ============================================================================
+
+# Read FCS file
+meta, data = parse('sample.fcs', reformat_meta=True)
+
+print(f"Shape: {data.shape}")
+print(f"Columns: {data.columns.tolist()}")
+
+# ============================================================================
+# 2. CREATE ANNDATA OBJECT
+# ============================================================================
+
+# Create AnnData object
+adata = sc.AnnData(data)
+adata.obs['sample'] = 'sample1'
+
+# ============================================================================
+# 3. TRANSFORM DATA
+# ============================================================================
+
+# Arcsinh transformation
+cofactor = 5
+adata.X = np.arcsinh(adata.X / cofactor)
+
+# ============================================================================
+# 4. PREPROCESSING
+# ============================================================================
+
+# Filter cells if needed (e.g., based on DNA content)
+# adata = adata[adata[:, 'DNA_channel'].X > threshold, :]
+
+# ============================================================================
+# 5. DIMENSIONALITY REDUCTION
+# ============================================================================
+
+# PCA
+sc.tl.pca(adata, svd_solver='arpack')
+sc.pl.pca_variance_ratio(adata)
+
+# UMAP
+sc.pp.neighbors(adata, n_neighbors=15, n_pcs=15)
+sc.tl.umap(adata)
+
+# tSNE
+sc.tl.tsne(adata, n_pcs=15)
+
+# ============================================================================
+# 6. CLUSTERING
+# ============================================================================
+
+# Leiden clustering
+sc.tl.leiden(adata, resolution=0.5)
+
+# Plot
+sc.pl.umap(adata, color='leiden', legend_loc='on data')
+
+# ============================================================================
+# 7. VISUALIZATION
+# ============================================================================
+
+# Marker expression on UMAP
+markers = ['CD3', 'CD4', 'CD8', 'CD19']  # Adjust to your markers
+sc.pl.umap(adata, color=markers, cmap='viridis')
+
+# Heatmap
+sc.pl.heatmap(adata, markers, groupby='leiden', cmap='viridis')
+
+# ============================================================================
+# 8. EXPORT
+# ============================================================================
+
+# Save results
+adata.write('output/cytof_analysis.h5ad')
+
+# Export cluster assignments
+results = pd.DataFrame({
+    'cluster': adata.obs['leiden'],
+    'UMAP1': adata.obsm['X_umap'][:, 0],
+    'UMAP2': adata.obsm['X_umap'][:, 1]
+})
+
+results.to_csv('output/cluster_results.csv')
+
+print("Analysis complete!")
+```
+
+This pipeline provides:
+- Data loading and QC
+- Transformation and preprocessing
+- Multiple clustering approaches
+- Dimensionality reduction (UMAP/tSNE)
+- Comprehensive visualization
+- Results export
+
+Customize the marker names, thresholds, and parameters based on your specific panel and experimental design!

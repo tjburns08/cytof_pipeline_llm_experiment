@@ -1,0 +1,203 @@
+Below is a concise, end‑to‑end R pipeline for analyzing a single CyTOF FCS file. It reads the file, performs basic QC/cleaning (beads/debris/doublets/dead removal), transforms, reduces dimensionality, clusters (FlowSOM), summarizes clusters, and exports results. Replace channel names/patterns to match your panel.
+
+R script
+
+# 0) Packages
+packages <- c(
+  "flowCore", "CATALYST", "SingleCellExperiment", "scater",
+  "FlowSOM", "ggplot2"
+)
+for (p in packages) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)
+library(flowCore)
+library(CATALYST)
+library(SingleCellExperiment)
+library(scater)
+library(FlowSOM)
+library(ggplot2)
+
+set.seed(123)
+
+# 1) Input
+f <- "path/to/your_single_sample.fcs"   # <- change this
+stopifnot(file.exists(f))
+
+# 2) Build panel and sample metadata from FCS header
+ff <- read.FCS(f, transformation = FALSE, truncate_max_range = FALSE)
+params <- pData(parameters(ff))
+
+# Antigen/marker names often live in $desc; fall back to $name if empty
+antigen <- params$desc
+antigen[is.na(antigen) | antigen == ""] <- params$name
+
+panel <- data.frame(
+  fcs_colname   = params$name,
+  antigen       = make.unique(antigen),  # ensure unique names
+  stringsAsFactors = FALSE
+)
+
+# Mark non-informative channels and classify markers
+is_non_signal <- grepl("^(Time|Center|Offset|Width|Residual)$", panel$fcs_colname, ignore.case = TRUE) |
+                 grepl("Event_length", panel$fcs_colname, ignore.case = TRUE) |
+                 grepl("Ce140|Bead", panel$fcs_colname, ignore.case = TRUE) |
+                 grepl("Ir191|Ir193|DNA", panel$fcs_colname, ignore.case = TRUE) |
+                 grepl("Pt19[5-8]|cis", panel$fcs_colname, ignore.case = TRUE)
+
+# Optionally label 'state' markers (phospho, activation, proliferation)
+is_state <- grepl("p[A-Z0-9]+|pS6|pERK|pSTAT|Ki-?67|HLA-?DR|CD69", panel$antigen, ignore.case = TRUE)
+
+panel$marker_class <- "type"
+panel$marker_class[is_state] <- "state"
+panel$marker_class[is_non_signal] <- "none"
+
+md <- data.frame(
+  file_name = basename(f),
+  sample_id = "S1",
+  condition = "sample",
+  stringsAsFactors = FALSE
+)
+
+# 3) Prepare data (arcsinh transform)
+sce <- CATALYST::prepData(
+  x = f,
+  panel = panel,
+  md = md,
+  cofactor = 5,          # common for CyTOF; adjust as needed (5–10 typical)
+  features = panel$fcs_colname
+)
+
+# 4) Basic QC and cleaning (beads, debris, doublets, dead)
+expr <- assay(sce, "exprs")  # features x cells
+feat_names <- rownames(sce)
+
+# Locate typical channels (adjust patterns to match your panel)
+get_feat_idx <- function(pattern) {
+  ix <- grep(pattern, feat_names, ignore.case = TRUE)
+  if (length(ix) == 0) return(NA_integer_) else return(ix[1])
+}
+get_feat_idxs <- function(pattern) grep(pattern, feat_names, ignore.case = TRUE)
+
+bead_idx <- get_feat_idx("Ce140|Bead")
+dna_idxs <- get_feat_idxs("Ir191|Ir193|DNA")
+el_idx   <- get_feat_idx("Event_length")
+cis_idx  <- get_feat_idx("Pt19[5-8]|cis")
+
+ncells <- ncol(sce)
+keep <- rep(TRUE, ncells)
+
+# Remove normalization beads (high Ce140/Bead)
+if (!is.na(bead_idx)) {
+  v <- expr[bead_idx, ]
+  thr <- quantile(v, 0.999, na.rm = TRUE)
+  keep <- keep & (v < thr)
+}
+
+# Event length: keep central bulk
+if (!is.na(el_idx)) {
+  v <- expr[el_idx, ]
+  lo <- quantile(v, 0.01, na.rm = TRUE)
+  hi <- quantile(v, 0.99, na.rm = TRUE)
+  keep <- keep & (v >= lo & v <= hi)
+}
+
+# DNA: remove debris (very low DNA) and doublets (very high total DNA)
+if (length(dna_idxs) >= 1) {
+  vsum <- colSums(expr[dna_idxs, , drop = FALSE])
+  lo <- quantile(vsum, 0.01, na.rm = TRUE)
+  hi <- quantile(vsum, 0.995, na.rm = TRUE)
+  keep <- keep & (vsum >= lo & vsum <= hi)
+}
+
+# Viability (cisplatin/Pt195): keep low signal (live)
+if (!is.na(cis_idx)) {
+  v <- expr[cis_idx, ]
+  thr <- quantile(v, 0.95, na.rm = TRUE)  # conservative; tune with density plot
+  keep <- keep & (v <= thr)
+}
+
+sce <- sce[, keep]
+cat(sprintf("Kept %d/%d cells after QC\n", ncol(sce), ncells))
+
+# 5) Choose features for clustering/DR
+rd <- rowData(sce)
+# In CATALYST, rowData typically includes marker_class
+if (!"marker_class" %in% colnames(rd)) {
+  rd$marker_class <- panel$marker_class[match(rownames(sce), panel$antigen)]
+  rowData(sce) <- rd
+}
+type_feats <- rownames(sce)[rd$marker_class == "type"]
+
+# Optionally drop residual unwanted channels from type_feats
+drop_patterns <- c("Event_length", "Ce140|Bead", "Ir191|Ir193|DNA", "Pt19[5-8]|cis")
+drop_idx <- unique(unlist(lapply(drop_patterns, function(p) grep(p, type_feats, ignore.case = TRUE))))
+if (length(drop_idx)) type_feats <- type_feats[-drop_idx]
+
+# 6) Dimensionality reduction
+sce <- CATALYST::runDR(sce, dr = "UMAP", features = type_feats, cells = NULL)
+
+# 7) Clustering (FlowSOM + meta-clustering)
+# Grid size controls number of SOM nodes; maxK controls meta-clusters
+sce <- CATALYST::cluster(
+  sce,
+  features = type_feats,
+  method = "FlowSOM",
+  xdim = 10, ydim = 10,        # 100 nodes
+  maxK = 20,                   # request up to 20 meta-clusters
+  seed = 123
+)
+
+# Choose K for reporting
+k <- 20
+cid <- CATALYST::cluster_ids(sce, k = paste0("meta", k))
+colData(sce)$cluster_id <- cid
+
+# 8) Quick visuals
+p1 <- CATALYST::plotDR(sce, "UMAP", color_by = "cluster_id")
+p2 <- CATALYST::plotDR(sce, "UMAP", color_by = type_feats[1])  # example marker overlay
+print(p1); print(p2)
+
+# 9) Cluster summaries
+# Marker heatmap (median expressions per cluster)
+pdf("cluster_marker_heatmap.pdf", width = 9, height = 6)
+CATALYST::plotExprHeatmap(
+  sce,
+  features = type_feats,
+  k = paste0("meta", k),
+  scale = "z",
+  q = 0.99,
+  bars = TRUE
+)
+dev.off()
+
+# Cluster medians and proportions
+agg <- CATALYST::aggregateData(sce, by = "cluster_id", fun = "median", assay = "exprs")
+cluster_medians <- as.data.frame(agg$exprs)
+cluster_medians$cluster_id <- rownames(cluster_medians)
+
+cluster_props <- prop.table(table(colData(sce)$cluster_id))
+cluster_props <- data.frame(cluster_id = names(cluster_props), proportion = as.numeric(cluster_props))
+
+write.csv(cluster_medians, "cluster_medians.csv", row.names = FALSE)
+write.csv(cluster_props,   "cluster_proportions.csv", row.names = FALSE)
+
+# 10) Export per-cell assignments
+assignments <- data.frame(
+  cell_id = colnames(sce),
+  cluster_id = colData(sce)$cluster_id,
+  stringsAsFactors = FALSE
+)
+write.csv(assignments, "cell_cluster_assignments.csv", row.names = FALSE)
+
+# Optional: save the SCE object to reuse
+saveRDS(sce, file = "cytof_single_sample_sce.rds")
+
+
+Notes and tips
+- Panel/channel names: Adjust the regex patterns for beads (Ce140/Bead), DNA (Ir191/Ir193), viability (Pt195 or cisplatin), and Event_length to match your file.
+- Arcsinh cofactor: 5 is common for CyTOF. If your signals are compressed or too spread, try 10.
+- QC thresholds: The quantile-based gates are safe defaults. For best results, inspect 2D plots (e.g., DNA vs Event_length, cisplatin vs DNA) and set thresholds accordingly.
+- Features for clustering: Use primarily lineage/type markers; keep state markers separate unless you specifically want functional states to drive clusters.
+- Clustering resolution: Increase xdim/ydim or maxK for finer granularity; reduce for coarser clusters.
+- One sample caveat: Without replicates, differential testing is not applicable; focus on QC, clustering, annotation, and descriptive summaries.
+- Debarcoding and bead normalization: If your file is barcoded and/or not bead-normalized, add those steps upstream using premessa or CATALYST debarcoding utilities.
+
+If you share your panel (channel names) I can tailor the gating patterns and thresholds precisely.

@@ -1,0 +1,265 @@
+Below is a concise, end-to-end CyTOF (mass cytometry) analysis pipeline for a single FCS file in R. It covers QC, basic gating, transformation, clustering (FlowSOM), dimensionality reduction (UMAP), and simple visualization/exports. It uses widely adopted packages and sensible defaults that you can tailor to your panel and instrument.
+
+Notes before you run:
+- Assumes a single, already debarcoded file. If you have barcoding, debarcode before this pipeline (e.g., in instrument software, CATALYST, or Premessa).
+- If bead normalization wasn’t done on-instrument, perform bead normalization first (e.g., Finck normalizer or instrument software). This script will remove residual beads if present.
+- You will need to confirm/adjust channel names for DNA, beads, and viability.
+- arcsinh cofactor 5 is typical; change as needed.
+
+R script (save as cytof_pipeline_one_file.R and run)
+
+# ---------- Install packages (first run only) ----------
+# install.packages(c("remotes"))
+# install.packages(c("ggplot2", "uwot"))
+# remotes::install_cran(c("flowCore"))
+# Bioconductor:
+# if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+# BiocManager::install(c("FlowSOM", "flowDensity", "PeacoQC"))
+
+# ---------- Load libraries ----------
+suppressPackageStartupMessages({
+  library(flowCore)
+  library(flowDensity)
+  library(PeacoQC)
+  library(FlowSOM)
+  library(uwot)
+  library(ggplot2)
+})
+
+set.seed(1234)
+
+# ---------- User inputs ----------
+fcs_path <- "path/to/your_file.fcs"   # Change this
+out_dir  <- "cytof_output_one_file"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# If your panel has known channel names, set them here (exact matches or grepl patterns).
+# Leave as NULL to auto-detect using common patterns.
+dna1_pattern <- "191Ir|Ir191|DNA1"
+dna2_pattern <- "193Ir|Ir193|DNA2"
+bead_pattern <- "140Ce|Ce140|Bead"
+viability_pattern <- "195Pt|Pt195|Dead|Viability"
+time_pattern <- "^Time$|\\bTime\\b"
+event_length_pattern <- "Event[_ ]?length|Event_length|event_length"
+
+# arcsinh cofactor
+cofactor <- 5
+
+# FlowSOM settings
+som_x <- 10
+som_y <- 10
+meta_k <- 20   # meta-clusters
+
+# UMAP settings
+umap_n_neighbors <- 30
+umap_min_dist <- 0.3
+
+# ---------- Read FCS ----------
+ff <- suppressWarnings(read.FCS(fcs_path, transformation = FALSE, alter.names = TRUE))
+expr <- exprs(ff)
+params <- pData(parameters(ff))
+channels <- params$name
+desc <- params$desc
+panel <- data.frame(channel = channels,
+                    marker  = ifelse(is.na(desc) | desc == "", channels, desc),
+                    stringsAsFactors = FALSE)
+
+# Helper to find channels by pattern
+find_channel <- function(patterns, where) {
+  idx <- unique(unlist(lapply(patterns, function(p) grep(p, where, ignore.case = TRUE))))
+  if (length(idx) == 0) return(character(0))
+  where[idx]
+}
+
+dna1_ch <- find_channel(c(dna1_pattern), panel$channel)
+dna2_ch <- find_channel(c(dna2_pattern), panel$channel)
+bead_ch <- find_channel(c(bead_pattern), panel$channel)
+viab_ch <- find_channel(c(viability_pattern), panel$channel)
+time_ch <- find_channel(c(time_pattern), panel$channel)
+event_len_ch <- find_channel(c(event_length_pattern), panel$channel)
+
+# Fallback: if DNA channels not found in 'channel', try 'marker' names
+if (length(dna1_ch) == 0) dna1_ch <- find_channel(c(dna1_pattern), panel$marker)
+if (length(dna2_ch) == 0) dna2_ch <- find_channel(c(dna2_pattern), panel$marker)
+if (length(bead_ch) == 0) bead_ch <- find_channel(c(bead_pattern), panel$marker)
+if (length(viab_ch) == 0) viab_ch <- find_channel(c(viability_pattern), panel$marker)
+if (length(time_ch) == 0) time_ch <- find_channel(c(time_pattern), panel$marker)
+if (length(event_len_ch) == 0) event_len_ch <- find_channel(c(event_length_pattern), panel$marker)
+
+message("Detected channels:")
+message(paste("DNA1:", paste(dna1_ch, collapse = ", ")))
+message(paste("DNA2:", paste(dna2_ch, collapse = ", ")))
+message(paste("Bead:", paste(bead_ch, collapse = ", ")))
+message(paste("Viability:", paste(viab_ch, collapse = ", ")))
+message(paste("Time:", paste(time_ch, collapse = ", ")))
+message(paste("Event_length:", paste(event_len_ch, collapse = ", ")))
+
+# ---------- Basic acquisition QC (remove unstable periods) ----------
+# Use PeacoQC to remove acquisition anomalies; use channels with broad signal
+qc_channels <- unique(c(dna1_ch, dna2_ch, viab_ch, event_len_ch))
+qc_channels <- qc_channels[qc_channels %in% colnames(expr)]
+if (length(qc_channels) >= 2 && length(time_ch) == 1) {
+  message("Running PeacoQC for acquisition QC...")
+  res_qc <- PeacoQC(ff,
+                    channels = qc_channels,
+                    Determination = "mad",
+                    Limit = 0.01,                # stringent; adjust as needed
+                    MaxPercRemoved = 0.5,        # fail-safe cap
+                    plot = FALSE, save_fcs = FALSE)
+  keep_qc <- res_qc$GoodCells
+} else {
+  message("Skipping PeacoQC (insufficient channels/time).")
+  keep_qc <- rep(TRUE, nrow(expr))
+}
+expr_qc <- expr[keep_qc, , drop = FALSE]
+
+# ---------- Remove normalization beads (if present) ----------
+if (length(bead_ch) >= 1) {
+  # If multiple bead channels, use the first
+  bead_use <- bead_ch[1]
+  # Gate threshold using flowDensity::deGate (valley between negative and bright beads)
+  thr_bead <- tryCatch({
+    deGate(flowCore::flowFrame(expr_qc), channel = which(colnames(expr_qc) == bead_use))
+  }, error = function(e) {
+    quantile(expr_qc[, bead_use], 0.995, na.rm = TRUE)
+  })
+  keep_no_beads <- expr_qc[, bead_use] < thr_bead
+  expr_qc <- expr_qc[keep_no_beads, , drop = FALSE]
+}
+
+# ---------- arcsinh transform ----------
+# Choose channels to transform: metal channels (exclude time, event_length, DNA, beads, viability)
+exclude_patterns <- c(time_pattern, event_length_pattern, dna1_pattern, dna2_pattern, bead_pattern, viability_pattern,
+                      "Center", "Offset", "Width", "Residual")
+exclude_idx <- unique(unlist(lapply(exclude_patterns, function(p) grep(p, colnames(expr_qc), ignore.case = TRUE))))
+transform_cols <- setdiff(seq_len(ncol(expr_qc)), exclude_idx)
+# transform only non-negative columns
+transform_cols <- transform_cols[apply(expr_qc[, transform_cols, drop = FALSE], 2, function(x) all(is.finite(x)))]
+
+expr_tr <- expr_qc
+expr_tr[, transform_cols] <- asinh(expr_qc[, transform_cols] / cofactor)
+
+# ---------- Basic biological gating: DNA+, singlets, live ----------
+keep <- rep(TRUE, nrow(expr_tr))
+
+# DNA gate: keep Ir191+ and Ir193+
+if (length(dna1_ch) >= 1) {
+  dna1 <- dna1_ch[1]
+  thr_dna1 <- tryCatch({
+    deGate(flowCore::flowFrame(expr_tr), channel = which(colnames(expr_tr) == dna1))
+  }, error = function(e) median(expr_tr[, dna1], na.rm = TRUE))
+  keep <- keep & (expr_tr[, dna1] > thr_dna1)
+}
+if (length(dna2_ch) >= 1) {
+  dna2 <- dna2_ch[1]
+  thr_dna2 <- tryCatch({
+    deGate(flowCore::flowFrame(expr_tr), channel = which(colnames(expr_tr) == dna2))
+  }, error = function(e) median(expr_tr[, dna2], na.rm = TRUE))
+  keep <- keep & (expr_tr[, dna2] > thr_dna2)
+}
+
+# Singlets: gate by event length (keep central band)
+if (length(event_len_ch) >= 1) {
+  el <- event_len_ch[1]
+  q <- quantile(expr_tr[, el], probs = c(0.02, 0.98), na.rm = TRUE)
+  keep <- keep & expr_tr[, el] >= q[1] & expr_tr[, el] <= q[2]
+}
+
+# Live cells: exclude 195Pt-high if present
+if (length(viab_ch) >= 1) {
+  viab <- viab_ch[1]
+  thr_viab <- tryCatch({
+    deGate(flowCore::flowFrame(expr_tr), channel = which(colnames(expr_tr) == viab))
+  }, error = function(e) quantile(expr_tr[, viab], 0.95, na.rm = TRUE))
+  # Keep viability-negative (below threshold)
+  keep <- keep & (expr_tr[, viab] < thr_viab)
+}
+
+expr_gated <- expr_tr[keep, , drop = FALSE]
+
+# ---------- Select markers for clustering ----------
+# Heuristic: use all transformed protein channels excluding housekeeping/special channels
+exclude_idx2 <- unique(unlist(lapply(exclude_patterns, function(p) grep(p, colnames(expr_gated), ignore.case = TRUE))))
+marker_cols <- setdiff(seq_len(ncol(expr_gated)), exclude_idx2)
+# If your panel has descriptive names in 'desc', you can refine this selection manually.
+
+if (length(marker_cols) < 5) {
+  stop("Too few markers selected for clustering. Please adjust marker selection.")
+}
+
+marker_names <- colnames(expr_gated)[marker_cols]
+message(paste("Markers used for clustering (", length(marker_names), "): ", paste(marker_names, collapse = ", "), sep=""))
+
+# ---------- FlowSOM clustering ----------
+ff_markers <- flowFrame(as.matrix(expr_gated[, marker_cols, drop = FALSE]))
+fsom <- FlowSOM(ff_markers,
+                compensate = FALSE, transform = FALSE, scale = TRUE,
+                colsToUse = colnames(expr_gated)[marker_cols],
+                xdim = som_x, ydim = som_y, rlen = 10, seed = 1234)
+
+meta <- metaClustering_consensus(fsom$map$codes, k = meta_k, seed = 1234)
+cluster_ids <- meta[fsom$map$mapping[, 1]]
+
+# ---------- UMAP ----------
+umap_emb <- umap(as.matrix(expr_gated[, marker_cols, drop = FALSE]),
+                 n_neighbors = umap_n_neighbors, min_dist = umap_min_dist,
+                 metric = "euclidean", fast_sgd = TRUE, n_threads = 0, verbose = TRUE)
+colnames(umap_emb) <- c("UMAP1", "UMAP2")
+
+# ---------- Summaries ----------
+df_out <- data.frame(expr_gated, cluster = factor(cluster_ids), UMAP1 = umap_emb[,1], UMAP2 = umap_emb[,2])
+
+# Cluster medians (marker by cluster)
+cluster_medians <- aggregate(expr_gated[, marker_cols, drop = FALSE],
+                             by = list(cluster = factor(cluster_ids)),
+                             FUN = median, na.rm = TRUE)
+
+# ---------- Save outputs ----------
+write.csv(df_out, file.path(out_dir, "cells_with_clusters_and_umap.csv"), row.names = FALSE)
+write.csv(cluster_medians, file.path(out_dir, "cluster_marker_medians.csv"), row.names = FALSE)
+
+# Optional: save gated FCS with cluster as a new parameter
+ff_gated <- flowFrame(as.matrix(expr_gated))
+# Append cluster as an extra parameter
+cluster_param <- new("AnnotatedDataFrame", data = data.frame(
+  name = "cluster", desc = "FlowSOM_meta_cluster", range = 1, minRange = 0, maxRange = max(cluster_ids)
+))
+parameters(ff_gated) <- rbind(parameters(ff_gated), pData(cluster_param))
+exprs(ff_gated) <- cbind(exprs(ff_gated), cluster = as.numeric(cluster_ids))
+suppressWarnings(write.FCS(ff_gated, filename = file.path(out_dir, "gated_with_cluster.fcs")))
+
+# ---------- Simple plots ----------
+# UMAP colored by cluster
+p1 <- ggplot(df_out, aes(UMAP1, UMAP2, color = cluster)) + geom_point(size = 0.3, alpha = 0.6) +
+  theme_minimal() + guides(color = guide_legend(override.aes = list(size = 3, alpha = 1)))
+ggsave(file.path(out_dir, "umap_by_cluster.png"), p1, width = 7, height = 6, dpi = 300)
+
+# Heatmap-like plot: cluster medians per marker (scaled)
+cm <- cluster_medians
+rownames(cm) <- cm$cluster
+cm$cluster <- NULL
+cm_sc <- t(scale(t(as.matrix(cm))))  # scale by marker
+df_hm <- reshape2::melt(cm_sc)
+colnames(df_hm) <- c("cluster", "marker", "scaled_median")
+p2 <- ggplot(df_hm, aes(marker, cluster, fill = scaled_median)) +
+  geom_tile() + scale_fill_gradient2(low = "navy", mid = "white", high = "firebrick", midpoint = 0) +
+  theme_minimal() + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+ggsave(file.path(out_dir, "cluster_marker_heatmap.png"), p2, width = 10, height = 6, dpi = 300)
+
+message("Done. Outputs written to: ", out_dir)
+
+
+How to adapt quickly
+- If your DNA channels are labeled differently, update dna1_pattern and dna2_pattern.
+- If no viability dye was used, the pipeline will skip that gate.
+- Adjust the arcsinh cofactor if your lab uses a different one (e.g., 6 or 10).
+- Change meta_k to set the number of meta-clusters.
+- For larger panels, you may want to explicitly list markers for clustering rather than using the heuristic.
+
+Optional extensions
+- Debarcoding: Use CATALYST or Premessa before this pipeline if you multiplexed samples.
+- Batch correction across multiple files: Consider CytoNorm or Harmony; for a single file this is not needed.
+- Differential analyses: With groups/conditions, integrate diffcyt/DAseq or use CATALYST workflows for DA/DS testing.
+- Additional QC: Use flowCut or more stringent PeacoQC settings if the run had acquisition issues.
+
+If you share the panel (channel names) or a small header from your FCS, I can tailor the gating and marker selection to your exact file.

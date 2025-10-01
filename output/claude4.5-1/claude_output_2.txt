@@ -1,0 +1,301 @@
+# CyTOF Analysis Pipeline for Single File
+
+Here's a comprehensive CyTOF analysis pipeline in R for analyzing a single FCS file:
+
+```r
+# ============================================================================
+# CyTOF Single File Analysis Pipeline
+# ============================================================================
+
+# Load required libraries
+library(flowCore)
+library(CATALYST)
+library(Rphenograph)
+library(FlowSOM)
+library(ConsensusClusterPlus)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(uwot)
+library(dplyr)
+library(reshape2)
+
+# ============================================================================
+# 1. DATA LOADING
+# ============================================================================
+
+# Load FCS file
+fcs_file <- "your_cytof_file.fcs"
+ff <- read.FCS(fcs_file, transformation = FALSE, truncate_max_range = FALSE)
+
+# Extract expression data
+expr_data <- exprs(ff)
+colnames(expr_data) <- parameters(ff)$desc
+
+print(paste("Loaded", nrow(expr_data), "cells with", ncol(expr_data), "parameters"))
+
+# ============================================================================
+# 2. DATA PREPROCESSING
+# ============================================================================
+
+# Define channels to analyze (exclude bead channels, DNA, dead cell markers if needed)
+# Modify these based on your panel
+exclude_channels <- c("Event_length", "Center", "Offset", "Width", "Residual",
+                      "Time", "Bead", "Viability", "Cisplatin", "DNA1", "DNA2")
+
+lineage_markers <- c("CD3", "CD4", "CD8", "CD19", "CD20", "CD14", "CD56", 
+                     "CD11c", "CD16", "CD45")  # Example - adjust to your panel
+
+functional_markers <- c("IFNg", "TNFa", "IL2", "IL4", "IL17", "GranzymeB", 
+                        "Perforin")  # Example - adjust to your panel
+
+all_markers <- c(lineage_markers, functional_markers)
+
+# Filter columns
+marker_cols <- colnames(expr_data)[colnames(expr_data) %in% all_markers]
+expr_matrix <- expr_data[, marker_cols]
+
+# ============================================================================
+# 3. DATA TRANSFORMATION
+# ============================================================================
+
+# Arcsinh transformation (cofactor = 5 is standard for CyTOF)
+cofactor <- 5
+expr_transformed <- asinh(expr_matrix / cofactor)
+
+# ============================================================================
+# 4. QUALITY CONTROL
+# ============================================================================
+
+# Remove doublets based on event length (if available)
+if("Event_length" %in% colnames(expr_data)) {
+  event_length <- expr_data[, "Event_length"]
+  singlets_idx <- event_length < quantile(event_length, 0.98)
+  expr_transformed <- expr_transformed[singlets_idx, ]
+  print(paste("Retained", sum(singlets_idx), "singlets"))
+}
+
+# Remove dead cells (if viability marker available)
+# Adjust threshold as needed
+if(any(grepl("Viability|Cisplatin", colnames(expr_data)))) {
+  viability_marker <- grep("Viability|Cisplatin", colnames(expr_data), value = TRUE)[1]
+  live_idx <- expr_data[, viability_marker] < 0.5  # Adjust threshold
+  expr_transformed <- expr_transformed[live_idx, ]
+  print(paste("Retained", sum(live_idx), "live cells"))
+}
+
+# Remove cells with very low signal (likely debris)
+total_intensity <- rowSums(expr_transformed)
+debris_threshold <- quantile(total_intensity, 0.01)
+clean_idx <- total_intensity > debris_threshold
+expr_transformed <- expr_transformed[clean_idx, ]
+
+print(paste("Final cell count:", nrow(expr_transformed)))
+
+# ============================================================================
+# 5. DIMENSIONALITY REDUCTION
+# ============================================================================
+
+# Subsample for faster computation if needed
+n_cells <- nrow(expr_transformed)
+max_cells <- 50000
+
+if(n_cells > max_cells) {
+  set.seed(42)
+  sample_idx <- sample(1:n_cells, max_cells)
+  expr_sample <- expr_transformed[sample_idx, ]
+} else {
+  expr_sample <- expr_transformed
+}
+
+# t-SNE
+set.seed(42)
+tsne_result <- Rtsne::Rtsne(expr_sample, dims = 2, perplexity = 30, 
+                            max_iter = 1000, check_duplicates = FALSE)
+tsne_coords <- tsne_result$Y
+colnames(tsne_coords) <- c("tSNE1", "tSNE2")
+
+# UMAP
+set.seed(42)
+umap_result <- umap(expr_sample, n_neighbors = 15, min_dist = 0.2)
+colnames(umap_result) <- c("UMAP1", "UMAP2")
+
+# ============================================================================
+# 6. CLUSTERING
+# ============================================================================
+
+# FlowSOM clustering
+set.seed(42)
+fsom <- FlowSOM(expr_sample, 
+                colsToUse = 1:ncol(expr_sample),
+                xdim = 10, ydim = 10,
+                nClus = 20,  # Number of metaclusters
+                seed = 42)
+
+flowsom_clusters <- fsom$metaclustering[fsom$FlowSOM$map$mapping[,1]]
+
+# Rphenograph clustering
+set.seed(42)
+phenograph_result <- Rphenograph(expr_sample, k = 30)
+phenograph_clusters <- membership(phenograph_result[[2]])
+
+# ============================================================================
+# 7. VISUALIZATION
+# ============================================================================
+
+# Create data frame for plotting
+plot_data <- data.frame(
+  tSNE1 = tsne_coords[,1],
+  tSNE2 = tsne_coords[,2],
+  UMAP1 = umap_result[,1],
+  UMAP2 = umap_result[,2],
+  FlowSOM = as.factor(flowsom_clusters),
+  Phenograph = as.factor(phenograph_clusters)
+)
+
+# Add marker expression
+plot_data <- cbind(plot_data, expr_sample)
+
+# Plot clusters on t-SNE
+p1 <- ggplot(plot_data, aes(x = tSNE1, y = tSNE2, color = FlowSOM)) +
+  geom_point(size = 0.5, alpha = 0.6) +
+  theme_minimal() +
+  ggtitle("FlowSOM Clusters (t-SNE)") +
+  theme(legend.position = "right")
+
+ggsave("cytof_tsne_flowsom.pdf", p1, width = 10, height = 8)
+
+# Plot clusters on UMAP
+p2 <- ggplot(plot_data, aes(x = UMAP1, y = UMAP2, color = FlowSOM)) +
+  geom_point(size = 0.5, alpha = 0.6) +
+  theme_minimal() +
+  ggtitle("FlowSOM Clusters (UMAP)") +
+  theme(legend.position = "right")
+
+ggsave("cytof_umap_flowsom.pdf", p2, width = 10, height = 8)
+
+# Plot individual markers
+for(marker in marker_cols) {
+  p <- ggplot(plot_data, aes_string(x = "UMAP1", y = "UMAP2", color = marker)) +
+    geom_point(size = 0.5, alpha = 0.6) +
+    scale_color_viridis_c() +
+    theme_minimal() +
+    ggtitle(paste(marker, "Expression"))
+  
+  ggsave(paste0("cytof_umap_", marker, ".pdf"), p, width = 8, height = 6)
+}
+
+# ============================================================================
+# 8. CLUSTER CHARACTERIZATION
+# ============================================================================
+
+# Calculate median marker expression per cluster
+cluster_medians <- aggregate(expr_sample, 
+                             by = list(Cluster = flowsom_clusters), 
+                             FUN = median)
+
+# Create heatmap
+rownames(cluster_medians) <- cluster_medians$Cluster
+cluster_medians <- cluster_medians[, -1]
+
+pdf("cytof_cluster_heatmap.pdf", width = 10, height = 8)
+pheatmap(t(cluster_medians),
+         scale = "none",
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         main = "Median Marker Expression per Cluster")
+dev.off()
+
+# ============================================================================
+# 9. CLUSTER FREQUENCIES
+# ============================================================================
+
+cluster_freq <- table(flowsom_clusters)
+cluster_freq_df <- data.frame(
+  Cluster = names(cluster_freq),
+  Count = as.numeric(cluster_freq),
+  Percentage = round(as.numeric(cluster_freq) / sum(cluster_freq) * 100, 2)
+)
+
+write.csv(cluster_freq_df, "cytof_cluster_frequencies.csv", row.names = FALSE)
+
+# Plot cluster frequencies
+p3 <- ggplot(cluster_freq_df, aes(x = reorder(Cluster, -Percentage), y = Percentage)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  xlab("Cluster") +
+  ylab("Percentage of Cells") +
+  ggtitle("Cluster Frequencies") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+ggsave("cytof_cluster_frequencies.pdf", p3, width = 10, height = 6)
+
+# ============================================================================
+# 10. EXPORT RESULTS
+# ============================================================================
+
+# Save processed data with cluster assignments
+output_data <- data.frame(
+  CellID = 1:nrow(expr_sample),
+  FlowSOM_Cluster = flowsom_clusters,
+  Phenograph_Cluster = phenograph_clusters,
+  tSNE1 = tsne_coords[,1],
+  tSNE2 = tsne_coords[,2],
+  UMAP1 = umap_result[,1],
+  UMAP2 = umap_result[,2],
+  expr_sample
+)
+
+write.csv(output_data, "cytof_analysis_results.csv", row.names = FALSE)
+
+# Save R workspace
+save.image("cytof_analysis_workspace.RData")
+
+print("Analysis complete! All results saved.")
+
+# ============================================================================
+# 11. OPTIONAL: STATISTICAL ANALYSIS
+# ============================================================================
+
+# Compare marker expression between clusters (example for CD4)
+if("CD4" %in% colnames(expr_sample)) {
+  cd4_by_cluster <- data.frame(
+    CD4 = expr_sample[, "CD4"],
+    Cluster = as.factor(flowsom_clusters)
+  )
+  
+  p4 <- ggplot(cd4_by_cluster, aes(x = Cluster, y = CD4, fill = Cluster)) +
+    geom_violin() +
+    geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+    theme_minimal() +
+    ggtitle("CD4 Expression by Cluster") +
+    theme(legend.position = "none")
+  
+  ggsave("cytof_cd4_by_cluster.pdf", p4, width = 10, height = 6)
+}
+
+```
+
+## Usage Instructions
+
+1. **Install required packages** (run once):
+```r
+install.packages(c("BiocManager", "devtools", "ggplot2", "pheatmap", 
+                   "RColorBrewer", "dplyr", "reshape2", "uwot"))
+BiocManager::install(c("flowCore", "CATALYST", "FlowSOM", "ConsensusClusterPlus"))
+devtools::install_github("JinmiaoChenLab/Rphenograph")
+```
+
+2. **Customize the pipeline**:
+   - Update `lineage_markers` and `functional_markers` to match your panel
+   - Adjust the cofactor if needed (typically 5 for CyTOF)
+   - Modify clustering parameters (number of clusters, k values)
+   - Adjust quality control thresholds
+
+3. **Run the pipeline**:
+```r
+source("cytof_analysis_pipeline.R")
+```
+
+This pipeline provides a complete workflow from raw FCS file to clustered, visualized results with statistical summaries!

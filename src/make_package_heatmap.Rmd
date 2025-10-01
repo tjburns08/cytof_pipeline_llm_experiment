@@ -1,0 +1,120 @@
+---
+title: "Make packages heatmap"
+output: html_document
+date: "2025-09-30"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Let's first read in our file.
+
+```{r}
+# From current working directory, go up one and into 
+setwd(here::here("output", "package_harvest"))
+lines <- readLines("package_harvest.txt", warn = FALSE, encoding = "UTF-8")
+lines <- lines[nzchar(trimws(lines))] # Get rid of extraneous spaces
+head(lines)
+```
+
+```{r}
+file_names <- character(0)
+pkg_list <- list()
+
+for (ln in lines) {
+  parts <- strsplit(ln, ":", fixed = TRUE)[[1]]
+  if (length(parts) < 2) next
+  file <- trimws(parts[1])
+  rhs  <- trimws(paste(parts[-1], collapse = ":")) # robust if ":" appears later
+  pkgs <- trimws(unlist(strsplit(rhs, ",")))
+  file_names <- c(file_names, file)
+  pkg_list[[file]] <- unique(pkgs[nzchar(pkgs)])
+}
+```
+
+```{r}
+file_names[1:5]
+pkg_list[1:2]
+```
+Ok. Next.
+
+```{r}
+# Preserve input order for columns
+files <- file_names
+
+# Packages ordered by frequency (toggle to alphabetical if preferred)
+all_pkgs  <- sort(unique(unlist(pkg_list)))
+pkg_freq  <- sapply(all_pkgs, function(p) sum(vapply(pkg_list, function(v) p %in% v, logical(1))))
+pkgs_ordered <- names(sort(pkg_freq, decreasing = TRUE))
+```
+
+```{r}
+pkg_freq[1:10]
+pkgs_ordered[1:5]
+```
+
+Seems to be working so far. Now we make our matrix.
+
+```{r}
+# Build binary matrix: rows = packages, cols = files
+mat <- matrix(0L, nrow = length(pkgs_ordered), ncol = length(files),
+              dimnames = list(pkgs_ordered, files))
+for (f in files) {
+  present <- pkg_list[[f]]
+  mat[intersect(present, rownames(mat)), f] <- 1L
+}
+```
+
+```{r}
+mat[1:5, 1:5]
+```
+
+Ok, seems to be working. Checking on my own reveals that it's not just 1's all the way down. Let's do another sanity check.
+
+```{r}
+sum(mat[3,]) # Should be 34
+```
+
+Check. And now we visualize.
+
+```{r}
+library(pheatmap)
+
+# Heatmap: high contrast, readable labels, no clustering
+pheatmap(mat,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE,
+         color = c("#F5F5F5", "#2C7FB8"),
+         legend = TRUE,
+         legend_labels = c("Absent", "Present"),
+         border_color = NA,
+         fontsize = 10,
+         fontsize_row = 6,
+         fontsize_col = 9,
+         angle_col = 90,
+         main = "Packages across LLM Outputs (1 = present)")
+```
+
+And if we cluster it:
+
+```{r}
+```{r}
+library(pheatmap)
+
+# Heatmap: high contrast, readable labels, no clustering
+pheatmap(mat,
+         cluster_rows = TRUE,
+         cluster_cols = TRUE,
+         color = c("#F5F5F5", "#2C7FB8"),
+         legend = TRUE,
+         legend_labels = c("Absent", "Present"),
+         border_color = NA,
+         fontsize = 10,
+         fontsize_row = 6,
+         fontsize_col = 9,
+         angle_col = 90,
+         main = "Packages across LLM Outputs (1 = present)")
+```
+```
+

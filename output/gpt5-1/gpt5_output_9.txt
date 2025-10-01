@@ -1,0 +1,211 @@
+Below is a practical, single-file CyTOF pipeline in R using CATALYST and FlowSOM. It takes a single FCS file from arcsinh transform through QC (beads/debris/dead/singlets), clustering, UMAP/tSNE, and exports results. It makes minimal assumptions and tries to auto-detect common channels; you can override them if needed.
+
+High-level steps
+- Input: one bead-normalized FCS (from instrument software) and its channel/marker metadata
+- Transform: arcsinh with cofactor 5
+- QC/gating: remove beads, debris (DNA-), doublets (event_length), dead (cisplatin/Pt)
+- Features: choose protein “type” markers for clustering
+- Clustering: FlowSOM + meta-clustering (K up to 20)
+- DR: UMAP and t-SNE
+- Output: SCE object (RDS), per-cell CSV (clusters + DR), cluster heatmaps and UMAPs
+
+R script (copy-paste and edit paths/marker overrides as needed)
+
+# ---- Setup ----
+# Install missing packages
+pkgs <- c("CATALYST","flowCore","FlowSOM","ConsensusClusterPlus","flowDensity",
+          "ggplot2","data.table","Rtsne","uwot")
+new  <- pkgs[!pkgs %in% installed.packages()[,1]]
+if (length(new)) install.packages(new, repos = "https://cloud.r-project.org")
+# Bioc packages
+bioc <- c("CATALYST","flowCore","FlowSOM","ConsensusClusterPlus")
+if (length(setdiff(bioc, installed.packages()[,1]))) {
+  if (!"BiocManager" %in% installed.packages()[,1]) install.packages("BiocManager")
+  BiocManager::install(setdiff(bioc, installed.packages()[,1]))
+}
+
+library(CATALYST)
+library(flowCore)
+library(FlowSOM)
+library(ConsensusClusterPlus)
+library(flowDensity)
+library(ggplot2)
+library(data.table)
+
+set.seed(42)
+
+# ---- User inputs ----
+FILE <- "path/to/your_file.fcs"       # <-- set this
+OUTDIR <- "cytof_onefile_output"      # results folder
+dir.create(OUTDIR, showWarnings = FALSE, recursive = TRUE)
+
+# Optional: override channel names if auto-detect fails
+override <- list(
+  dna = c(),             # e.g., c("191Ir_DNA1","193Ir_DNA2")
+  dead = character(0),   # e.g., "195Pt_Cisplatin"
+  bead = character(0),   # e.g., "140Ce_Bead"
+  event_length = character(0), # e.g., "Event_length"
+  time = character(0)    # e.g., "Time"
+)
+
+# ---- Build panel from FCS ----
+ff <- read.FCS(FILE, transformation = FALSE, truncate_max_range = FALSE)
+param <- flowCore::pData(parameters(ff))
+fcs_colname <- param$name
+antigen <- param$desc
+antigen[is.na(antigen) | antigen == ""] <- fcs_colname
+
+panel <- data.frame(
+  fcs_colname = fcs_colname,
+  antigen = antigen,
+  stringsAsFactors = FALSE
+)
+
+# Auto-detect common channels
+g <- function(pat) grep(pat, panel$antigen, ignore.case = TRUE, value = TRUE)
+dna_guess  <- unique(c(g("DNA"), g("^19[13].*Ir")))
+dead_guess <- g("cis|pt|viab|live/?dead|dead")
+bead_guess <- g("bead|^140.*ce")
+el_guess   <- g("event[_ ]?length|length")
+time_guess <- g("^time$|acquisition")
+
+dna  <- if (length(override$dna))  override$dna  else dna_guess
+dead <- if (length(override$dead)) override$dead else dead_guess
+bead <- if (length(override$bead)) override$bead else bead_guess
+event_length <- if (length(override$event_length)) override$event_length else el_guess
+time <- if (length(override$time)) override$time else time_guess
+
+# Mark non-protein channels as "none"; others as "type"
+none_markers <- unique(c(dna, dead, bead, event_length, time))
+panel$marker_class <- ifelse(panel$antigen %in% none_markers, "none", "type")
+
+# ---- Minimal metadata (md) ----
+md <- data.frame(
+  file_name = basename(FILE),
+  sample_id = tools::file_path_sans_ext(basename(FILE)),
+  condition = tools::file_path_sans_ext(basename(FILE)),
+  stringsAsFactors = FALSE
+)
+
+# ---- Prepare SCE (arcsinh transform) ----
+sce <- prepData(
+  from = FILE,
+  panel = panel,
+  md = md,
+  cofactor = 5,
+  transform = TRUE
+)
+
+# ---- QC / gating ----
+expr <- assay(sce, "exprs")
+ff_tr <- flowFrame(expr)
+
+keep <- rep(TRUE, nrow(expr))
+
+# 1) Remove beads (if present): keep low Ce/bead
+if (length(bead) >= 1 && bead[1] %in% colnames(expr)) {
+  thr_bead <- tryCatch(
+    deGate(ff_tr, channel = bead[1], use.percentile = TRUE, percentile = 0.99),
+    error = function(e) quantile(expr[, bead[1]], 0.99, na.rm = TRUE)
+  )
+  keep <- keep & (expr[, bead[1]] < thr_bead)
+}
+
+# 2) Keep DNA+ cells (avoid debris)
+if (length(dna) >= 1 && dna[1] %in% colnames(expr)) {
+  thr_dna1 <- tryCatch(
+    deGate(ff_tr, channel = dna[1]),
+    error = function(e) quantile(expr[, dna[1]], 0.05, na.rm = TRUE)
+  )
+  keep <- keep & (expr[, dna[1]] > thr_dna1)
+}
+if (length(dna) >= 2 && dna[2] %in% colnames(expr)) {
+  thr_dna2 <- tryCatch(
+    deGate(ff_tr, channel = dna[2]),
+    error = function(e) quantile(expr[, dna[2]], 0.05, na.rm = TRUE)
+  )
+  keep <- keep & (expr[, dna[2]] > thr_dna2)
+}
+
+# 3) Singlets by event length (remove extreme short/long)
+if (length(event_length) >= 1 && event_length[1] %in% colnames(expr)) {
+  low_el  <- quantile(expr[, event_length[1]], 0.05, na.rm = TRUE)
+  high_el <- quantile(expr[, event_length[1]], 0.95, na.rm = TRUE)
+  keep <- keep & expr[, event_length[1]] >= low_el & expr[, event_length[1]] <= high_el
+}
+
+# 4) Live cells (cisplatin/Pt low)
+if (length(dead) >= 1 && dead[1] %in% colnames(expr)) {
+  thr_dead <- tryCatch(
+    deGate(ff_tr, channel = dead[1]),
+    error = function(e) quantile(expr[, dead[1]], 0.95, na.rm = TRUE)
+  )
+  keep <- keep & (expr[, dead[1]] < thr_dead)
+}
+
+sce <- sce[, keep]
+cat(sprintf("QC retained %d of %d events (%.1f%%)\n",
+            ncol(sce), nrow(expr), 100*ncol(sce)/nrow(expr)))
+
+# ---- Feature selection for clustering ----
+type_markers <- panel$antigen[panel$marker_class == "type"]
+type_markers <- intersect(type_markers, rownames(sce))
+
+# ---- Clustering (FlowSOM + meta-clustering) ----
+sce <- cluster(
+  sce,
+  features = type_markers,
+  xdim = 10, ydim = 10,
+  maxK = 20,
+  seed = 42,
+  verbose = TRUE
+)
+
+# ---- Dimensionality reduction ----
+sce <- runDR(sce, dr = c("UMAP","TSNE"), features = type_markers)
+
+# ---- Visualization ----
+pdf(file.path(OUTDIR, "UMAP_by_meta20.pdf"), width = 7, height = 6)
+print(plotDR(sce, "UMAP", color_by = "meta20"))
+dev.off()
+
+pdf(file.path(OUTDIR, "Heatmap_meta20.pdf"), width = 9, height = 7)
+print(plotExprHeatmap(
+  sce,
+  features = type_markers,
+  by = "meta20",
+  fun = "median",
+  scale = "last",
+  bars = TRUE
+))
+dev.off()
+
+# ---- Exports ----
+saveRDS(sce, file.path(OUTDIR, "sce_cytof_onefile.rds"))
+
+df <- data.frame(
+  cell_id = colnames(sce),
+  sample_id = colData(sce)$sample_id,
+  cluster_id = colData(sce)$cluster_id,
+  meta20 = colData(sce)$meta20,
+  UMAP1 = reducedDim(sce, "UMAP")[,1],
+  UMAP2 = reducedDim(sce, "UMAP")[,2],
+  TSNE1 = reducedDim(sce, "TSNE")[,1],
+  TSNE2 = reducedDim(sce, "TSNE")[,2],
+  check.names = FALSE
+)
+fwrite(df, file.path(OUTDIR, "cell_level_embeddings_and_clusters.csv"))
+
+meds <- aggregateExprs(sce, by = "meta20", fun = "median")[["exprs"]]
+fwrite(as.data.frame(meds), file.path(OUTDIR, "cluster_medians_meta20.csv"), row.names = TRUE)
+
+Notes and tips
+- Bead normalization/debarcoding: This script assumes the input FCS is already normalized (standard for Helios/Hyperion exports). If barcoded, debarcode upstream (e.g., Premessa) and then run this per debarcoded sample.
+- Channel detection: The simple auto-detect covers common labels (DNA, Pt/cisplatin, Ce/bead, Event_length, Time). If it misses your markers, set the overrides up top.
+- Markers: By default, everything not DNA/viability/bead/time/length is treated as “type”. If you maintain a curated panel with type/state distinctions, set panel$marker_class accordingly before prepData.
+- Cofactor: 5 is typical for CyTOF; adjust if your lab standard differs.
+- K values: cluster() computes meta-clusters up to K=20; you can change maxK. Use plotExprHeatmap to decide which K best separates biology.
+- Optional QC: For acquisition anomalies, consider adding PeacoQC to flag time-based drifts before clustering.
+- Reproducibility: The script sets seeds and saves a single RDS containing all results.
+
+If you share your FCS channel names or a panel sheet, I can tailor the marker detection and gating to your exact setup.
