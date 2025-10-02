@@ -16,4 +16,4 @@ Go to output/ to find the folders for each model's output, which contain 10 text
 
 You'll see a folder called package_harvest. This contains package_harvest.txt, which contains the packages used in each run.
 
-You'll also see a folder called run_notes. This contains two org-mode files (they can be read as simple textfiles), one of which is run_llm_red_team.org, which took one output file from each model and red-teamed the output in order to find anything that I missed manually looking through it. The other file is run_notes.org, which is my notes that I took as I was going through each of the files myself.
+You'll also see a folder called run_notes. This contains two org-mode files (an Emacs version of Markdown) and a text file, one of which is run_llm_red_team.txt (originally run_llm_red_team.org, but GitHub did not recognize some of the output, so I made it into a text file for the reader), which took one output file from each model and red-teamed the output in order to find anything that I missed manually looking through it. The other file is run_notes.org, which is my notes that I took as I was going through each of the files myself.
