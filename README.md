@@ -17,3 +17,13 @@ Go to output/ to find the folders for each model's output, which contain 10 text
 You'll see a folder called package_harvest. This contains package_harvest.txt, which contains the packages used in each run.
 
 You'll also see a folder called run_notes. This contains two org-mode files (an Emacs version of Markdown) and a text file, one of which is run_llm_red_team.txt (originally run_llm_red_team.org, but GitHub did not recognize some of the output, so I made it into a text file for the reader), which took one output file from each model and red-teamed the output in order to find anything that I missed manually looking through it. The other file is run_notes.org, which is my notes that I took as I was going through each of the files myself.
+
+## Suggestions
+
+If you have experience with programmatic CyTOF analysis, have a look at the LLM outputs and see how it compares to how you would do an analysis pipeline? What is missing? What is right? What is flat out wrong?
+
+Try running some of the code chunks. In some instances, a top-to-bottom script is offered. Try running that. Where does it break?
+
+Take the code from multi_run.sh, and change the prompt to make it more specific. Have the LLMs give you a multiple-file run. See what statistical software (e.g. diffcyt) and batch effect correction modalities it chooses by default, and whether the code that it gives you is sensical.
+
+Try adding a red-team pass to the script. Combine the initial prompt, the initial output and results of the red-team output into a single string and have that be the prompt, and see if the subsequent output is more rigorous and/or overengineered.
