@@ -5,3 +5,4 @@ tmp/
 cytof_prompting.org
 .Rproj.user/
 .Rhistory
+*.Rproj
